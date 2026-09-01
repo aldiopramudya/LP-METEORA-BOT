@@ -1,0 +1,86 @@
+{
+  "mode": "dry",
+  "stage": 1,
+  "tickSeconds": 30,
+  "screenMinutes": 5,
+  "entryGapMinutes": 10,
+  "maxPools": 2,
+  "reserveSol": 0.3,
+  "coin": {
+    "minMcap": 250000,
+    "maxMcap": 3000000,
+    "minHolders": 2000,
+    "minPoolAgeH": 10,
+    "minChg24h": -30,
+    "maxChg24h": 100,
+    "baseFeeMin": 1,
+    "baseFeeMax": 2
+  },
+  "liquidity": {
+    "minTvl": 20000,
+    "maxTvl": 100000,
+    "minFeeTvl24h": 10,
+    "minFee24hSol": 3,
+    "maxFeeTvl1h": 2,
+    "maxVol1hVsAvg": 3,
+    "maxSizePctTvl": 1.5
+  },
+  "technical": {
+    "maxDrawdownFromPeak": 30,
+    "minChg1h": -10,
+    "targetDepth": 0.45,
+    "minBins": 40,
+    "maxBins": 80,
+    "oorBandPct": 2,
+    "maxChg1h": 15
+  },
+  "exit": {
+    "slPct": -15,
+    "slTicks": 2,
+    "fastSlDrop": 10,
+    "partyOverAfterMin": 60,
+    "partyOverWindowMin": 30,
+    "partyOverMinShare": 0.1,
+    "oorUpMin": 15,
+    "maxHoldH": 6,
+    "cooldownH": 12
+  },
+  "tiers": [
+    {
+      "maxTvl": 35000,
+      "sizeSol": 0.5
+    },
+    {
+      "maxTvl": 60000,
+      "sizeSol": 1.0
+    },
+    {
+      "maxTvl": 100000,
+      "sizeSol": 2.0
+    },
+    {
+      "maxTvl": 1000000000000.0,
+      "sizeSol": 3.0
+    }
+  ],
+  "stages": {
+    "1": {
+      "capPerPool": 0.5,
+      "capTotal": 1.0,
+      "dailyHaltSol": 0.2
+    },
+    "2": {
+      "capPerPool": 2.0,
+      "capTotal": 4.0,
+      "dailyHaltSol": 0.5
+    },
+    "3": {
+      "capPerPool": 3.0,
+      "capTotal": 6.0,
+      "dailyHaltSol": 1.0
+    }
+  },
+  "solUsdFallback": 100,
+  "wallet": "YOUR_WALLET_PUBKEY",
+  "handsDir": "./hands"
+}

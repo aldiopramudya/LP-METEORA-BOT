@@ -1,0 +1,11 @@
+node_modules/
+config.json
+state.json*
+results.jsonl
+journal.jsonl
+heartbeat.json*
+.env
+*.log
+.DS_Store
+*.bak*
+*.orig
