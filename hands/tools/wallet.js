@@ -8,6 +8,15 @@ import {
 import bs58 from "bs58";
 import { log } from "../logger.js";
 import { config } from "../config.js";
+import {
+  computeSimulationEffects,
+  describeRejection,
+  evaluateSwapSafety,
+  priceImpactPercent,
+  resolveSlippageBps,
+  swapDirection,
+} from "./swap-guard.js";
+import { STATUS } from "./liquidation-status.js";
 
 // Exported at bottom for limit-exit.js (patient exit orders need signing + API key).
 let _connection = null;
@@ -131,6 +140,12 @@ export async function getWalletBalances() {
  */
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
+/** Token programs enumerated when snapshotting wallet token state for the simulation gate. */
+const TOKEN_PROGRAMS_FOR_SNAPSHOT = [
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+];
+
 // Normalize any SOL-like address to the correct wrapped SOL mint
 export function normalizeMint(mint) {
   if (!mint) return mint;
@@ -146,11 +161,101 @@ export function normalizeMint(mint) {
   return mint;
 }
 
+/**
+ * Snapshot every token account the wallet owns, plus its native SOL balance.
+ * Used as the "before" side of the pre/post simulation comparison.
+ */
+async function snapshotWalletTokenState(connection, owner) {
+  const ownerKey = owner instanceof PublicKey ? owner : new PublicKey(owner);
+  const preTokenAccounts = {};
+  const addresses = [];
+  for (const programId of TOKEN_PROGRAMS_FOR_SNAPSHOT) {
+    let res;
+    try {
+      res = await connection.getParsedTokenAccountsByOwner(ownerKey, { programId: new PublicKey(programId) });
+    } catch (e) {
+      log("swap_warn", `token snapshot failed for ${programId.slice(0, 8)}: ${e.message}`);
+      continue;
+    }
+    for (const { pubkey, account } of res.value || []) {
+      const info = account?.data?.parsed?.info;
+      if (!info?.mint) continue;
+      const addr = pubkey.toString();
+      preTokenAccounts[addr] = { mint: String(info.mint), amountAtomic: String(info.tokenAmount?.amount ?? "0") };
+      addresses.push(addr);
+    }
+  }
+  const preSolLamports = await connection.getBalance(ownerKey);
+  return { preSolLamports, preTokenAccounts, tokenAddresses: addresses };
+}
+
+/**
+ * Simulate a deserialized swap transaction and reduce it to the guard's `simulate`
+ * input. Returns null when the RPC cannot simulate (the caller then fails closed).
+ *
+ * Nothing is signed or submitted here: `sigVerify:false` lets the RPC simulate an
+ * unsigned transaction, and `replaceRecentBlockhash:true` stops a stale blockhash from
+ * producing a false failure.
+ */
+async function simulateSwapEffects(connection, owner, transaction, snapshot, feeAllowanceLamports) {
+  const ownerStr = owner instanceof PublicKey ? owner.toString() : String(owner);
+  const addressOrder = [ownerStr, ...snapshot.tokenAddresses];
+  let res;
+  try {
+    res = await connection.simulateTransaction(transaction, {
+      sigVerify: false,
+      replaceRecentBlockhash: true,
+      accounts: { encoding: "base64", addresses: addressOrder },
+    });
+  } catch (e) {
+    log("swap_warn", `simulation unavailable: ${e.message}`);
+    return { simulate: null, simErr: e.message };
+  }
+  if (!res?.value) return { simulate: null, simErr: "simulation returned no value" };
+  if (res.value.err) {
+    log("swap_warn", `simulation failed: ${JSON.stringify(res.value.err).slice(0, 160)}`);
+    return { simulate: null, simErr: `simulation error: ${JSON.stringify(res.value.err).slice(0, 160)}` };
+  }
+  const sim = computeSimulationEffects({
+    owner: ownerStr,
+    preSolLamports: snapshot.preSolLamports,
+    preTokenAccounts: snapshot.preTokenAccounts,
+    postAccounts: res.value.accounts || null,
+    addressOrder,
+    feeAllowanceLamports,
+  });
+  return { simulate: sim, simErr: sim.ok ? null : sim.err };
+}
+
+/**
+ * Authoritative, freshly-read on-chain token balance for one mint, in atomic units.
+ * Returns null when the chain could not be read — callers must treat null as "unknown",
+ * never as zero (a stale/absent read must not authorise closing an account).
+ */
+export async function getOnChainTokenBalanceAtomic(owner, mint) {
+  const connection = getConnection();
+  const ownerKey = owner instanceof PublicKey ? owner : new PublicKey(owner);
+  try {
+    for (const programId of TOKEN_PROGRAMS_FOR_SNAPSHOT) {
+      const res = await connection.getParsedTokenAccountsByOwner(ownerKey, { programId: new PublicKey(programId) });
+      for (const { account } of res.value || []) {
+        const info = account?.data?.parsed?.info;
+        if (info?.mint === mint) return BigInt(info.tokenAmount?.amount ?? "0");
+      }
+    }
+    return 0n;
+  } catch (e) {
+    log("wallet_warn", `on-chain token balance read failed for ${String(mint).slice(0, 8)}: ${e.message}`);
+    return null;
+  }
+}
+
 export async function swapToken({
   input_mint,
   output_mint,
   amount,
   _splitDepth = 0,
+  _requoteAttempt = 0,
 }) {
   input_mint  = normalizeMint(input_mint);
   output_mint = normalizeMint(output_mint);
@@ -176,41 +281,55 @@ export async function swapToken({
     }
     const amountStr = Math.floor(amount * Math.pow(10, decimals)).toString();
 
-    // ─── Get Swap V2 order (unsigned tx + requestId) ───────────
-    const search = new URLSearchParams({
-      inputMint: input_mint,
-      outputMint: output_mint,
-      amount: amountStr,
-      taker: wallet.publicKey.toString(),
-    });
-    const referralParams = getJupiterReferralParams();
-    if (referralParams) {
-      search.set("referralAccount", referralParams.referralAccount);
-      search.set("referralFee", String(referralParams.referralFee));
-    }
-    const orderUrl = `${JUPITER_SWAP_V2_API}/order?${search.toString()}`;
+    // ─── Execution-safety configuration (F3) ───────────────────
+    // These are execution bounds, not strategy parameters: they do not change what we
+    // trade, when we trade, or how much. See ./swap-guard.js for the rationale.
+    const direction = swapDirection(input_mint, output_mint);
+    const slippageBps = resolveSlippageBps(config.management.liquidationSlippageBps);
+    const maxImpactPct = Number(config.management.maxSwapPriceImpactPct ?? 6);
+    const feeAllowanceLamports = Math.max(0, Math.trunc(Number(config.management.swapFeeAllowanceLamports ?? 20000)));
+    const temporarySolDebitLamports = Math.max(0, Math.trunc(Number(config.management.liquidationSolDebitAllowanceLamports ?? 0)));
+    const rejectOnMissingPriceImpact = config.management.rejectOnMissingPriceImpact !== false;
+    const maxRequotes = Math.max(0, Math.trunc(Number(config.management.maxSwapRequotes ?? 1)));
     const jupiterApiKey = getJupiterApiKey();
+    const referralParams = getJupiterReferralParams();
 
-    const orderRes = await fetch(orderUrl, {
-      headers: jupiterApiKey ? { "x-api-key": jupiterApiKey } : {},
-    });
-    if (!orderRes.ok) {
-      const body = await orderRes.text();
-      throw new Error(`Swap V2 order failed: ${orderRes.status} ${body}`);
-    }
+    // ─── Order fetch (re-quotable, with the slippage bound always attached) ───
+    const fetchOrder = async () => {
+      const search = new URLSearchParams({
+        inputMint: input_mint,
+        outputMint: output_mint,
+        amount: amountStr,
+        taker: wallet.publicKey.toString(),
+        // Never rely on a provider default: state the bound we are willing to sign.
+        slippageBps: String(slippageBps),
+      });
+      if (referralParams) {
+        search.set("referralAccount", referralParams.referralAccount);
+        search.set("referralFee", String(referralParams.referralFee));
+      }
+      const res = await fetch(`${JUPITER_SWAP_V2_API}/order?${search.toString()}`, {
+        headers: jupiterApiKey ? { "x-api-key": jupiterApiKey } : {},
+      });
+      if (!res.ok) {
+        throw new Error(`Swap V2 order failed: ${res.status} ${await res.text()}`);
+      }
+      const o = await res.json();
+      if (o.errorCode || o.errorMessage) {
+        throw new Error(`Swap V2 order error: ${o.errorMessage || o.errorCode}`);
+      }
+      return o;
+    };
 
-    const order = await orderRes.json();
-    if (order.errorCode || order.errorMessage) {
-      throw new Error(`Swap V2 order error: ${order.errorMessage || order.errorCode}`);
-    }
+    let order = await fetchOrder();
 
     // ─── Slippage guard: split high-impact swaps into two smaller chunks ───
     // Meme-token exits (esp. stop-loss dumps into shallow order books) can quote
     // low impact one moment and land far worse a block later. Halving the order
     // meaningfully reduces realized impact on thin liquidity. Bounded to one
     // split (never recurses past _splitDepth 1) to avoid runaway chunking.
-    const quotedImpactPct = order.priceImpactPct != null ? Math.abs(Number(order.priceImpactPct)) * 100 : null;
-    const maxImpactPct = Number(config.management.maxSwapPriceImpactPct ?? 6);
+    // Each chunk re-enters this whole function and therefore re-runs the full gate.
+    const quotedImpactPct = priceImpactPercent(order.priceImpactPct);
     if (_splitDepth === 0 && quotedImpactPct != null && quotedImpactPct > maxImpactPct && Number(amountStr) > 2000) {
       log("swap_warn", `Quoted price impact ${quotedImpactPct.toFixed(2)}% > ${maxImpactPct}% — splitting ${amount} ${input_mint.slice(0, 8)} into 2 chunks`);
       const half = amount / 2;
@@ -220,12 +339,80 @@ export async function swapToken({
       return mergeSplitSwapResults(first, second);
     }
 
-    const { transaction: unsignedTx, requestId } = order;
+    // ─── Snapshot the wallet once, before any signing ──────────
+    const snapshot = await snapshotWalletTokenState(connection, wallet.publicKey);
 
-    // ─── Deserialize and sign ─────────────────────────────────
-    const tx = VersionedTransaction.deserialize(Buffer.from(unsignedTx, "base64"));
+    // ─── Simulate + gate. Nothing is signed until this passes. ─
+    let decision = null;
+    let tx = null;
+    for (let attempt = 0; ; attempt++) {
+      tx = VersionedTransaction.deserialize(Buffer.from(order.transaction, "base64"));
+      const { simulate } = await simulateSwapEffects(
+        connection, wallet.publicKey, tx, snapshot, feeAllowanceLamports,
+      );
+      decision = evaluateSwapSafety({
+        direction,
+        inputMint: input_mint,
+        outputMint: output_mint,
+        wallet: wallet.publicKey.toString(),
+        inputAmountAtomic: amountStr,
+        quotedOutAtomic: order.outAmount,
+        slippageBps,
+        // Normalized to percent at this boundary — the guard compares against a percent
+        // ceiling, and the raw provider fraction would disable that comparison.
+        priceImpactPct: quotedImpactPct,
+        maxPriceImpactPct: maxImpactPct,
+        rejectOnMissingPriceImpact,
+        simulate,
+        allowances: {
+          expectedSolDebitLamports: 0,
+          temporarySolDebitLamports,
+          maxUnrelatedTokenDebitAtomic: 0,
+        },
+      });
+
+      if (decision.safe) break;
+
+      log("swap_rejected", JSON.stringify(describeRejection({
+        route: order?.routePlan?.[0]?.swapInfo?.label ?? order?.router ?? null,
+        provider: order?.router ?? null,
+        decision,
+        inputMint: input_mint,
+        outputMint: output_mint,
+        inputAmountAtomic: amountStr,
+        quotedOutAtomic: order.outAmount,
+        slippageBps,
+        simulatedSolDeltaLamports: simulate?.solDeltaLamports ?? null,
+        priceImpactPct: quotedImpactPct,
+      })));
+
+      if (attempt >= maxRequotes) {
+        log("swap_error", `route rejected (${decision.code}) and re-quote budget exhausted: ${decision.reason}`);
+        return {
+          success: false,
+          status: STATUS.FAILED,
+          rejected: true,
+          reject_code: decision.code,
+          reject_reason: decision.reason,
+          reject_details: decision.details,
+          simulated_sol_delta_lamports: simulate?.solDeltaLamports ?? null,
+          quoted_out_atomic: order.outAmount != null ? String(order.outAmount) : null,
+          min_out_atomic: decision.minOutAtomic != null ? String(decision.minOutAtomic) : null,
+          slippage_bps: slippageBps,
+          input_mint,
+          output_mint,
+          error: `swap route failed execution-safety gate: ${decision.code} — ${decision.reason}`,
+        };
+      }
+      // A different quote may route differently. Limits are NEVER loosened to fit a route.
+      log("swap_warn", `re-quoting ${input_mint.slice(0, 8)}→${output_mint.slice(0, 8)} after ${decision.code} (attempt ${attempt + 1}/${maxRequotes})`);
+      order = await fetchOrder();
+    }
+
+    // ─── Sign only now that the route is proven within bounds ──
     tx.sign([wallet]);
     const signedTx = Buffer.from(tx.serialize()).toString("base64");
+    const requestId = order.requestId;
 
     // ─── Execute ───────────────────────────────────────────────
     const execRes = await fetch(`${JUPITER_SWAP_V2_API}/execute`, {
@@ -266,6 +453,7 @@ export async function swapToken({
 
     return {
       success: true,
+      status: STATUS.SOLD,
       tx: result.signature,
       input_mint,
       output_mint,
@@ -273,6 +461,13 @@ export async function swapToken({
       amount_out: result.outputAmountResult,
       quote_out_sol: outIsSol ? toSolUi(order.outAmount) : null,
       out_sol_ui: outIsSol ? toSolUi(result.outputAmountResult) : null,
+      // Execution-safety evidence for telemetry: what bound was enforced and what the
+      // pre-sign simulation said the wallet's native SOL delta would be.
+      slippage_bps: slippageBps,
+      min_out_atomic: decision?.minOutAtomic != null ? String(decision.minOutAtomic) : null,
+      simulated_sol_delta_lamports: decision?.details?.netSolCreditLamports != null
+        ? String(decision.details.netSolCreditLamports) : null,
+      guard_code: decision?.code ?? null,
       price_impact_pct: order.priceImpactPct != null ? Number(order.priceImpactPct) : null,
       usd_in_quote: order.inUsdValue != null ? Number(order.inUsdValue) : null,
       usd_out_quote: order.outUsdValue != null ? Number(order.outUsdValue) : null,

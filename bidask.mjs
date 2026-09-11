@@ -13,6 +13,7 @@ import { State } from "./lib/state.mjs";
 import { Tg } from "./lib/tg.mjs";
 import { discover, poolDetail, priceChange, solUsd } from "./lib/meteora.mjs";
 import { screen, binsFor, sizeFor, exitDecision } from "./lib/rules.mjs";
+import { recordDust, clearDust, getDust } from "./hands/tools/dust-registry.js";
 
 const DIR = dirname(fileURLToPath(import.meta.url));
 const OPS = join(DIR, "..");
@@ -49,6 +50,20 @@ async function readPosition(o) {
   return { valueSol: valueBase + feesSol, amtX: w > 0 ? 1 : 0, amtY: o.deployedSol * (1 - w), feesSol, oorUp: P > P0 * (1 + CONF.technical.oorBandPct / 100), priceSolPerX: P, dry: true };
 }
 
+// ── F1: reclaim rent dari ATA kosong. Best-effort, rate-limited, tidak pernah bikin close gagal.
+let lastRentSweep = 0;
+async function reclaimRent(mint, sym) {
+  if (Date.now() - lastRentSweep < 60e3) return;          // 1× per menit cukup
+  lastRentSweep = Date.now();
+  try {
+    // LIVE()→sweep betulan; dry→cuma rencana (CLI nolak kirim kalau DRY_RUN hidup)
+    const r = await cli.cleanupEmptyAtas({ live: LIVE() });
+    if (failed(r) && !r?.dry_run) log(`rent reclaim ${sym}: ${String(r?.error).slice(0, 120)}`);
+    else log(`rent reclaim ${sym}: ${r?.dry_run ? "dry-run" : `closed=${r?.summary?.closed ?? 0} lamports=${r?.summary?.recoveredLamports ?? 0}`}`);
+    if (LIVE() && (r?.summary?.closed ?? 0) > 0) { clearDust(mint, "rent reclaimed"); await tg.send(`🧹 ${tag()}: rent ${r.summary.recoveredLamports} lamports balik (${r.summary.closed} ATA)`); }
+  } catch (e) { log(`rent reclaim ${sym}: ${e.message}`); }
+}
+
 // ── close dengan eskalasi: normal → reconcile (account gone) → backfill registry + skip-swap ──
 async function closePosition(st, key, o, why) {
   if (o.dry) { delete st.open[key]; return { success: true, dry: true, auto_swapped: true }; }
@@ -62,9 +77,15 @@ async function closePosition(st, key, o, why) {
     if (failed(res)) { try { if (await rpc.accountGone(o.position)) res = { success: true, reconciled: "gone post-force" }; } catch {} }
   }
   if (!failed(res)) {
-    if (o.mint && res.auto_swapped !== true) st.pendingSells[o.mint] = { sym: o.sym, since: Date.now(), tries: 0, why: res.skipSwap ? "skip-swap" : res.reconciled ? "reconciled" : "swap-gagal" };
+    // F2: dust is NOT a completed liquidation. Only enqueue a sell when there is
+    // something worth selling and nothing has already classified it as dust.
+    const liqStatus = res.liquidation_status;
+    if (o.mint && res.auto_swapped !== true && liqStatus !== "dust") st.pendingSells[o.mint] = { sym: o.sym, since: Date.now(), tries: 0, why: res.skipSwap ? "skip-swap" : res.reconciled ? "reconciled" : "swap-gagal" };
+    if (o.mint && liqStatus === "dust") log(`${o.sym}: liquidation DUST — bukan pendingSell, ATA tidak ditutup`);
     delete st.open[key]; sdk.forget(o.pool);
     if (o.closeFails >= 3 && !st.blacklist.includes(o.pool)) st.blacklist.push(o.pool);
+    // F1: the base mint is provably empty → reclaim the rent its ATA is holding.
+    if (o.mint && res.auto_swapped === true) await reclaimRent(o.mint, o.sym);
     return res;
   }
   o.closeFails++;
@@ -151,17 +172,77 @@ async function manage(st) {
 }
 
 // ── token sisa & deploy tertunda & escrow ───────────────────────────────────
+// F2: tiga keadaan yang berbeda, jangan pernah disamakan.
+//   saldo 0        → bukan "terjual", tapi "kosong" → tutup ATA (F1)
+//   dust           → TIDAK dijual dan TIDAK dicap terjual; stop bakar gas
+//   layak dijual   → coba jual, lalu baca ulang on-chain buat putuskan
+const MAX_PENDING_TRIES = 6;      // batas keras: sisa yang ga bisa dijual bukan loop fee abadi
+const RESIDUAL_DUST_RATIO = 0.001; // sisa < 0.1% dari yang dijual = dust, bukan "belum kelar"
+
 async function sellPending(st) {
   for (const [mint, ps] of Object.entries(st.pendingSells)) {
     if (ps.nextTry && Date.now() < ps.nextTry) continue;
+
     let bal; try { bal = await rpc.tokenBal(mint); } catch (e) { log(`pendingSell ${ps.sym}: ${e.message}`); continue; }
-    if (bal <= 0) { delete st.pendingSells[mint]; continue; }
+
+    // KOSONG — bukan terjual, tapi tidak ada lagi yang bisa dijual. Reclaim rent-nya.
+    if (bal <= 0) {
+      log(`pendingSell ${ps.sym}: saldo 0 — bersihin + reclaim rent`);
+      delete st.pendingSells[mint];
+      await reclaimRent(mint, ps.sym);
+      continue;
+    }
+
+    // SUDAH DUST — jangan ulang, jangan bilang terjual.
+    const known = getDust(mint);
+    if (known) {
+      log(`pendingSell ${ps.sym}: DUST terdaftar (${known.reason}) — stop retry`);
+      delete st.pendingSells[mint];
+      continue;
+    }
+
+    // Batas percobaan: sisa yang ga bisa dijual ga boleh jadi loop fee abadi.
+    if ((ps.tries || 0) >= MAX_PENDING_TRIES) {
+      recordDust({ mint, symbol: ps.sym, balanceAtomic: Math.round(bal * 1e9),
+        reason: `tidak bisa dijual setelah ${ps.tries}× percobaan`, position: null });
+      await tg.send(`🧹 ${tag()}: sisa ${ps.sym} ditandai DUST setelah ${ps.tries}× (BUKAN terjual)`);
+      delete st.pendingSells[mint];
+      continue;
+    }
+
     ps.tries = (ps.tries || 0) + 1;
     const r = LIVE() ? await cli.swap(mint, bal) : { success: true, dry: true };
-    if (r && r.success !== false && !r.error && (r.tx || r.amount_out || r.dry)) { log(`pendingSell ${ps.sym}: SOLD ${bal}`); await tg.send(`🧹 ${tag()}: sisa token ${ps.sym} kejual (${ps.why})`); delete st.pendingSells[mint]; }
-    else { ps.nextTry = Date.now() + Math.min(30 * 60e3, 60e3 * 2 ** Math.min(ps.tries, 5)); log(`pendingSell ${ps.sym}: gagal ${ps.tries}x ${String(r?.error).slice(0, 80)}`);
+    const ok = r && r.success !== false && !r.error && (r.tx || r.amount_out || r.dry);
+    if (!ok) {
+      ps.nextTry = Date.now() + Math.min(30 * 60e3, 60e3 * 2 ** Math.min(ps.tries, 5));
+      log(`pendingSell ${ps.sym}: gagal ${ps.tries}x ${String(r?.error).slice(0, 80)}`);
       if (ps.tries === 3) await tg.send(`⚠️ ${tag()}: sisa token ${ps.sym} GA BISA dijual 3× — ${String(r?.error).slice(0, 100)}`);
-      if (Date.now() - ps.since > 48 * 3600e3) delete st.pendingSells[mint]; }
+      continue;
+    }
+
+    // Terjual (kata CLI). Hanya baca ulang on-chain yang boleh memutuskan.
+    let after; try { after = await rpc.tokenBal(mint); } catch (e) { log(`pendingSell ${ps.sym}: baca ulang gagal: ${e.message}`); continue; }
+    if (after <= 0) {
+      log(`pendingSell ${ps.sym}: SOLD bersih ${bal}`);
+      await tg.send(`🧹 ${tag()}: sisa token ${ps.sym} kejual (${ps.why})`);
+      delete st.pendingSells[mint];
+      clearDust(mint, "terjual bersih");
+      await reclaimRent(mint, ps.sym);
+      continue;
+    }
+
+    // Sisa sedikit setelah penjualan = DUST, bukan "belum selesai".
+    if (bal > 0 && after / bal < RESIDUAL_DUST_RATIO) {
+      recordDust({ mint, symbol: ps.sym, balanceAtomic: Math.round(after * 1e9),
+        reason: `sisa ${after} setelah menjual ${bal} — dust, bukan terjual penuh`, position: null });
+      log(`pendingSell ${ps.sym}: sisa ${after} ditandai DUST — berhenti retry`);
+      delete st.pendingSells[mint];
+      continue;
+    }
+
+    ps.nextTry = Date.now() + Math.min(30 * 60e3, 60e3 * 2 ** Math.min(ps.tries, 5));
+    log(`pendingSell ${ps.sym}: sebagian terjual, sisa ${after} — coba lagi nanti`);
+    if (Date.now() - ps.since > 48 * 3600e3) delete st.pendingSells[mint];
   }
 }
 async function adoptLateDeploys(st) {

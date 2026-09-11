@@ -127,7 +127,11 @@ function getMeridianHeaders() {
 }
 
 function shouldUseLpAgentRelay() {
-  return !!config.api.lpAgentRelayEnabled;
+  // F3 note: the relay zap-out is a SECOND liquidation path — it signs its own close +
+  // swap transactions and never touches wallet.js/swap-guard.js. It therefore requires
+  // an explicit environment acknowledgement in addition to the config flag, so it can
+  // never activate implicitly. Default is off (config.js: lpAgentRelayEnabled ?? false).
+  return !!config.api.lpAgentRelayEnabled && process.env.ALLOW_RELAY_ZAPOUT === "true";
 }
 
 function shouldUseLpAgentRelayForDeploy() {

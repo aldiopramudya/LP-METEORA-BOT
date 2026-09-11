@@ -10,7 +10,17 @@ import {
   searchPools,
   getTxFeesSol,
 } from "./dlmm.js";
-import { getWalletBalances, swapToken } from "./wallet.js";
+import { getWalletBalances, swapToken, getWallet, getOnChainTokenBalanceAtomic, getConnection } from "./wallet.js";
+import { PublicKey } from "@solana/web3.js";
+import {
+  ACTION,
+  DEFAULT_DUST_FLOOR_ATOMIC,
+  DEFAULT_DUST_FLOOR_USD,
+  STATUS,
+  classifyLiquidation,
+} from "./liquidation-status.js";
+import { recordDust } from "./dust-registry.js";
+import { cleanupEmptyAtas } from "./ata-cleanup.js";
 import { tryPlaceLimitExit } from "./limit-exit.js";
 import "./tvl-recorder.js"; // self-starts: per-minute TVL snapshots of open pools (observational)
 import { studyTopLPers } from "./study.js";
@@ -650,38 +660,167 @@ const PROTECTED_TOOLS = new Set([
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** Mint decimals, cached. Needed to compare a UI balance against atomic dust floors. */
+const _decimalsCache = new Map();
+async function getMintDecimals(mint) {
+  if (_decimalsCache.has(mint)) return _decimalsCache.get(mint);
+  let decimals = null;
+  try {
+    const info = await getConnection().getParsedAccountInfo(new PublicKey(mint));
+    decimals = info?.value?.data?.parsed?.info?.decimals ?? null;
+  } catch (e) {
+    log("executor_warn", `mint decimals read failed for ${String(mint).slice(0, 8)}: ${e.message}`);
+  }
+  if (decimals != null) _decimalsCache.set(mint, decimals);
+  return decimals;
+}
+
+/** UI balance -> atomic units, without float drift past 2^53. Returns 0n on junk input. */
+function uiToAtomic(uiAmount, decimals) {
+  const n = Number(uiAmount);
+  if (!Number.isFinite(n) || n <= 0) return 0n;
+  const d = Number.isFinite(Number(decimals)) ? Number(decimals) : 0;
+  return BigInt(Math.floor(n * 10 ** d));
+}
+
 /**
- * Swap a base token back to SOL with retry. Jupiter can transiently fail (no route,
- * quote error) and a single attempt silently leaves the token unsold — this retries
- * with a delay, re-fetching the balance each attempt (amounts can shift on partial
- * fills). Treats both a throw AND result.success===false / missing tx as failure.
- * Returns { swapped, result, token } — swapped=false if nothing to do or all attempts failed.
+ * Liquidate a base token back to SOL, with a bounded retry and an explicit outcome.
+ *
+ * Replaces the old `token.usd < 0.10 → "already sold or dust" → swapped:true` behaviour,
+ * which reported a successful sale for a balance it never touched (leaving the token and
+ * its ATA behind) and treated a MISSING price as dust because `null < 0.10` is true.
+ *
+ * Now every attempt is classified into an explicit state and the caller is told which:
+ *   sold   — swap confirmed AND a fresh on-chain re-read shows exactly zero
+ *   zero   — nothing to sell; the ATA is reclaimable
+ *   dust   — nonzero but uneconomic; never retried in a loop, never called "sold"
+ *   retry  — bounded retry still worthwhile
+ *   failed — retries exhausted; balance remains
+ *
+ * @param {string} baseMint
+ * @param {string} label
+ * @param {{position?:string}} [ctx]
+ * @returns {Promise<{status:string, action:string, swapped:boolean, result:object|null, token:object|null, solPrice:number|null, reason:string|null, balanceAtomic:string, postBalanceAtomic:string|null, dryRun?:boolean}>}
  */
-async function swapBaseToSolWithRetry(baseMint, label) {
+async function swapBaseToSolWithRetry(baseMint, label, ctx = {}) {
   const attempts = Math.max(1, Number(config.management.autoSwapRetryAttempts ?? 3));
   const delayMs = Math.max(0, Number(config.management.autoSwapRetryDelayMs ?? 3000));
+  const dustFloorUsd = Number(config.management.dustFloorUsd ?? DEFAULT_DUST_FLOOR_USD);
+  const dustFloorAtomic = Number(config.management.dustFloorAtomic ?? DEFAULT_DUST_FLOOR_ATOMIC);
+  const isDryRun = process.env.DRY_RUN === "true";
+  const owner = getWallet().publicKey.toString();
   let lastErr = null;
+
+  const done = (status, action, extra = {}) => ({
+    status, action, swapped: status === STATUS.SOLD, result: null, token: null,
+    solPrice: null, reason: null, balanceAtomic: "0", postBalanceAtomic: null, ...extra,
+  });
+
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    let balances = null;
+    let token = null;
     try {
-      const balances = await getWalletBalances({});
-      const token = balances.tokens?.find((t) => t.mint === baseMint);
-      if (!token || token.usd < 0.10) {
-        // Nothing left to swap (already sold or dust) — treat as done.
-        return { swapped: attempt > 1, result: null, token: null, solPrice: null };
-      }
-      log("executor", `Auto-swapping ${label} ${token.symbol || baseMint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL (attempt ${attempt}/${attempts})`);
-      const swapResult = await swapToken({ input_mint: baseMint, output_mint: "SOL", amount: token.balance });
-      const ok = swapResult && swapResult.success !== false && !swapResult.error && (swapResult.tx || swapResult.amount_out);
-      if (ok) return { swapped: true, result: swapResult, token, solPrice: balances.sol_price || null };
-      lastErr = swapResult?.error || swapResult?.reason || "swap returned no tx";
+      balances = await getWalletBalances({});
+      token = balances.tokens?.find((t) => t.mint === baseMint) || null;
+    } catch (e) {
+      lastErr = e.message;
+      log("executor_warn", `Auto-swap ${label}: balance read failed (${e.message})`);
+      if (attempt < attempts) await sleep(delayMs);
+      continue;
+    }
+    const solPrice = balances.sol_price || null;
+    const decimals = await getMintDecimals(baseMint);
+    const balanceAtomic = token ? uiToAtomic(token.balance, decimals) : 0n;
+
+    const pre = classifyLiquidation({
+      balanceAtomic, usdValue: token?.usd ?? null, dustFloorUsd, dustFloorAtomic,
+      attempts: attempt - 1, maxAttempts: attempts,
+    });
+
+    if (pre.status === STATUS.ZERO) {
+      return done(STATUS.ZERO, ACTION.CLEANUP, { solPrice, reason: pre.reason });
+    }
+    if (pre.status === STATUS.DUST) {
+      log("executor", `Auto-swap ${label}: ${String(baseMint).slice(0, 8)} is DUST (${pre.reason}) — not swapping, and NOT marking it as sold`);
+      return done(STATUS.DUST, ACTION.RECORD_DUST, {
+        token, solPrice, reason: pre.reason, balanceAtomic: balanceAtomic.toString(),
+      });
+    }
+
+    log("executor", `Auto-swapping ${label} ${token?.symbol || String(baseMint).slice(0, 8)} back to SOL (attempt ${attempt}/${attempts})`);
+    let swapResult = null;
+    try {
+      swapResult = await swapToken({ input_mint: baseMint, output_mint: "SOL", amount: token.balance });
     } catch (e) {
       lastErr = e.message;
     }
-    log("executor_warn", `Auto-swap ${label} attempt ${attempt}/${attempts} failed: ${lastErr}`);
+
+    if (swapResult?.dry_run) {
+      return done(STATUS.RETRY, ACTION.SWAP, {
+        token, solPrice, dryRun: true, reason: "DRY_RUN — no transaction sent",
+        balanceAtomic: balanceAtomic.toString(),
+      });
+    }
+
+    const ok = swapResult && swapResult.success !== false && !swapResult.error && (swapResult.tx || swapResult.amount_out);
+    if (!ok) {
+      lastErr = swapResult?.error || swapResult?.reject_reason || "swap returned no tx";
+      const after = classifyLiquidation({
+        balanceAtomic, usdValue: token?.usd ?? null, dustFloorUsd, dustFloorAtomic,
+        swapAttempted: true, swapOk: false, swapError: lastErr,
+        attempts: attempt, maxAttempts: attempts,
+      });
+      log("executor_warn", `Auto-swap ${label} attempt ${attempt}/${attempts} failed: ${lastErr} → ${after.status}`);
+      if (after.status === STATUS.FAILED) {
+        return done(STATUS.FAILED, ACTION.GIVE_UP, {
+          token, solPrice, reason: after.reason, balanceAtomic: balanceAtomic.toString(),
+        });
+      }
+      if (attempt < attempts) await sleep(delayMs);
+      continue;
+    }
+
+    // Swap reported success. Only a FRESH ON-CHAIN read may authorise cleanup — a stale
+    // Helius zero must never be mistaken for an empty account.
+    await sleep(1500);
+    const postAtomic = await getOnChainTokenBalanceAtomic(owner, baseMint);
+    const post = classifyLiquidation({
+      balanceAtomic, usdValue: token?.usd ?? null, dustFloorUsd, dustFloorAtomic,
+      swapAttempted: true, swapOk: true,
+      postBalanceAtomic: postAtomic === null ? null : Number(postAtomic),
+      attempts: attempt, maxAttempts: attempts,
+    });
+    log("executor", `Auto-swap ${label}: post-swap on-chain balance ${postAtomic === null ? "unknown" : postAtomic} → ${post.status}`);
+
+    if (post.status === STATUS.SOLD || post.status === STATUS.ZERO) {
+      return done(STATUS.SOLD, ACTION.CLEANUP, {
+        swapped: true, result: swapResult, token, solPrice,
+        reason: post.reason, balanceAtomic: "0", postBalanceAtomic: "0",
+      });
+    }
+    if (post.status === STATUS.DUST) {
+      // A swap DID execute, but the mint is not empty. `swapped` deliberately stays false
+      // here: only a confirmed zero balance means "liquidated". Reporting swapped:true for
+      // a residual is exactly the semantic bug this task exists to remove.
+      return done(STATUS.DUST, ACTION.RECORD_DUST, {
+        swap_executed: true, result: swapResult, token, solPrice,
+        reason: post.reason, balanceAtomic: balanceAtomic.toString(),
+        postBalanceAtomic: postAtomic === null ? null : postAtomic.toString(),
+      });
+    }
+    lastErr = post.reason;
+    if (post.status === STATUS.FAILED) {
+      return done(STATUS.FAILED, ACTION.GIVE_UP, {
+        token, solPrice, reason: post.reason,
+        balanceAtomic: balanceAtomic.toString(),
+        postBalanceAtomic: postAtomic === null ? null : postAtomic.toString(),
+      });
+    }
     if (attempt < attempts) await sleep(delayMs);
   }
-  log("executor_warn", `Auto-swap ${label} failed after ${attempts} attempts — base token left unsold (${baseMint.slice(0, 8)})`);
-  return { swapped: false, result: null, token: null, solPrice: null };
+
+  log("executor_warn", `Auto-swap ${label} failed after ${attempts} attempts — base token left unsold (${String(baseMint).slice(0, 8)})`);
+  return done(STATUS.FAILED, ACTION.GIVE_UP, { reason: lastErr || "retries exhausted" });
 }
 
 /**
@@ -873,16 +1012,83 @@ export async function executeTool(name, args) {
               return result;
             }
           }
-          const { swapped, result: swapResult, token: swapTokenHeld, solPrice } = await swapBaseToSolWithRetry(result.base_mint, "after close");
-          if (swapped) {
-            // Tell the model the swap already happened so it doesn't call swap_token again
+          const liq = await swapBaseToSolWithRetry(result.base_mint, "after close", { position: args.position_address });
+          // The liquidation outcome is reported explicitly. "dust" is NOT "sold": the
+          // token is still in the wallet and its ATA still holds rent, so the model is
+          // told the truth instead of being told the swap already happened (F2).
+          result.liquidation_status = liq.status;
+          result.liquidation_reason = liq.reason ?? null;
+
+          if (liq.status === STATUS.SOLD) {
             result.auto_swapped = true;
-            result.auto_swap_note = `Base token already auto-swapped back to SOL (${result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
-            if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
+            result.auto_swap_note = `Base token liquidated and confirmed empty on-chain (${result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
+            if (liq.result?.amount_out) result.sol_received = liq.result.amount_out;
             // Detached so slippage accounting can never delay or fail the close path.
-            if (swapResult && swapTokenHeld) {
-              const swapBackCtx = { position: args.position_address, token: swapTokenHeld, solPrice, swapResult };
+            if (liq.result && liq.token) {
+              const swapBackCtx = { position: args.position_address, token: liq.token, solPrice: liq.solPrice, swapResult: liq.result };
               setImmediate(() => { void recordSwapBackSlippage(swapBackCtx); });
+            }
+          } else if (liq.status === STATUS.ZERO) {
+            result.auto_swapped = true;
+            result.auto_swap_note = `Base token balance is already exactly zero — nothing to liquidate. Do NOT call swap_token.`;
+          } else if (liq.status === STATUS.DUST) {
+            result.auto_swapped = false;
+            result.dust = recordDust({
+              mint: result.base_mint,
+              symbol: liq.token?.symbol || null,
+              balanceAtomic: liq.postBalanceAtomic ?? liq.balanceAtomic,
+              usdValue: liq.token?.usd ?? null,
+              reason: liq.reason,
+              position: args.position_address,
+            });
+            result.auto_swap_note = `Base token left as DUST (${liq.reason}). It is NOT sold — do not report it as liquidated and do not retry it every tick.`;
+          } else {
+            result.auto_swapped = false;
+            result.auto_swap_note = `Liquidation did not complete (${liq.status}): ${liq.reason}. Token remains in the wallet.`;
+          }
+
+          // ── F1: reclaim the rent this cycle was holding (best effort) ──
+          // Only after the mint is provably empty, and only for this cycle's mint. Any
+          // failure here is logged and swallowed — it must never make the close look
+          // failed (requirement F1.9).
+          const isDryRunNow = process.env.DRY_RUN === "true";
+          if (config.management.reclaimAtaRentAfterClose && (liq.status === STATUS.SOLD || liq.status === STATUS.ZERO)) {
+            try {
+              // The same base mint can back OTHER live positions (this wallet ran 8
+              // separate cycles on one mint). Closing that ATA would strip the token
+              // account out from under a position that is still open, so every live
+              // position's mint is passed in as a blocker.
+              let activePositionMints = [];
+              try {
+                const live = await getMyPositions({ force: true, silent: true });
+                activePositionMints = (live?.positions || []).map((p) => p.base_mint).filter(Boolean);
+              } catch (e) {
+                // Fail closed: without the live list we cannot prove the account is free,
+                // so the sweep is refused rather than risked.
+                log("executor_warn", `ATA cleanup skipped — live position list unavailable: ${e.message}`);
+                activePositionMints = null;
+              }
+              if (activePositionMints !== null) {
+                const cleanup = await cleanupEmptyAtas({
+                  dryRun: isDryRunNow,
+                  mints: [result.base_mint],
+                  maxPerTx: Number(config.management.maxAtaClosesPerTx ?? 8),
+                  activePositionMints,
+                  allowLive: !isDryRunNow,
+                });
+                result.ata_cleanup = {
+                  dry_run: cleanup.dryRun,
+                  closed: cleanup.summary?.closed ?? 0,
+                  skipped: cleanup.summary?.skipped ?? 0,
+                  recovered_lamports: cleanup.summary?.recoveredLamports ?? "0",
+                  error: cleanup.success === false ? cleanup.error : null,
+                };
+                if (cleanup.summary?.closed > 0) {
+                  log("executor", `Reclaimed rent: ${cleanup.summary.closed} account(s), ${cleanup.summary.recoveredLamports} lamports (${result.base_mint.slice(0, 8)})`);
+                }
+              }
+            } catch (e) {
+              log("executor_warn", `ATA rent reclamation skipped for ${result.base_mint.slice(0, 8)}: ${e.message}`);
             }
           }
         }
