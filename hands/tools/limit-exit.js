@@ -24,7 +24,7 @@ import { VersionedTransaction } from "@solana/web3.js";
 import { log } from "../logger.js";
 import { config } from "../config.js";
 import { repoPath } from "../repo-root.js";
-import { getWallet, getJupiterApiKey, getWalletBalances, swapToken, normalizeMint } from "./wallet.js";
+import { getWallet, getJupiterApiKey, getWalletBalances, swapToken, normalizeMint, getOnChainTokenBalanceAtomic } from "./wallet.js";
 
 const TRIGGER_API = "https://api.jup.ag/trigger/v1";
 const SWAP_V2_API = "https://api.jup.ag/swap/v2";
@@ -33,12 +33,19 @@ const STATE_FILE = repoPath("limit-orders.json");
 const HISTORY_FILE = repoPath("limit-orders-history.jsonl");
 const WATCH_INTERVAL_MS = 2 * 60 * 1000;
 const EXPIRY_GRACE_MS = 3 * 60 * 1000; // keeper needs a moment to return funds
-const DUST_USD = 0.10;
+// Dust handling for this module: see hands/tools/liquidation-status.js — the old local
+// `DUST_USD = 0.10` constant conflated "cheap" with "empty" and is intentionally gone.
 
 function cfg() {
   const m = config.management || {};
   return {
-    enabled: m.limitExitEnabled ?? true,
+    // F3 note: this path signs Jupiter Trigger transactions directly and is NOT covered
+    // by the swap-guard gate in wallet.js (it rests a limit order instead of
+    // market-selling). It is therefore gated twice — the config flag AND an explicit
+    // environment acknowledgement. Defaulting to `true` here would let one lost config
+    // key silently re-open a token-moving path that has no F3 protection.
+    // This also matches the standing user decision (08-27: patient/limit exit disabled).
+    enabled: (m.limitExitEnabled ?? false) && process.env.ALLOW_LIMIT_EXIT === "true",
     offsetPct: Number(m.limitExitOffsetPct ?? 0.3),
     maxWaitMinutes: Number(m.limitExitMaxWaitMinutes ?? 30),
     minUsd: Number(m.limitExitMinUsd ?? 5),
@@ -183,8 +190,13 @@ async function checkPending() {
     const keep = [];
     for (const entry of pending) {
       const token = balances.tokens?.find((t) => t.mint === entry.mint);
-      const remainingUsd = token?.usd ?? 0;
-      if (remainingUsd < DUST_USD) {
+      // F2 semantics: an order is FILLED when the BALANCE is zero — never when the USD
+      // price is merely missing or small. Reading a Helius price gap as "filled" would
+      // retire a live order while the tokens are still in the wallet.
+      const onChainAtomic = await getOnChainTokenBalanceAtomic(getWallet().publicKey.toString(), entry.mint)
+        .catch(() => null);
+      const balanceGone = onChainAtomic !== null && onChainAtomic === 0n;
+      if (balanceGone) {
         // Tokens gone → order filled (or already swept). Either way: done.
         history({ type: "filled", mint: entry.mint, symbol: entry.symbol, usd_at_placement: entry.usd_at_placement, taking_lamports: entry.taking_lamports });
         log("limit_exit", `Patient exit FILLED: ${entry.symbol} — received asked price (quote+${entry.offset_pct}%) instead of paying market impact`);
@@ -192,7 +204,9 @@ async function checkPending() {
       }
       const expiresAt = new Date(entry.expires_at).getTime();
       if (now >= expiresAt + EXPIRY_GRACE_MS) {
-        const sold = await fallbackMarketSell(entry, token.balance);
+        const amountToSell = Number.isFinite(token?.balance) && token.balance > 0 ? token.balance : null;
+        if (amountToSell === null) { keep.push(entry); continue; } // balance unreadable — retry next tick
+        const sold = await fallbackMarketSell(entry, amountToSell);
         if (!sold) keep.push(entry); // retry the fallback next tick
         continue;
       }

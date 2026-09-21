@@ -90,6 +90,17 @@ Closes a position. Auto-swaps base token to SOL unless --skip-swap.
 Output: { success, pnl_pct, pnl_usd, txs, base_mint }
 \`\`\`
 
+### meridian cleanup-empty-atas [--dry-run] [--live] [--all] [--max-per-tx 8]
+Reclaims rent from empty token accounts (F1). Dry-run by DEFAULT; sending needs --live
+(and DRY_RUN must be off). Restricted to mints from this bot's own position/dust
+lifecycle unless --all is given. Skips wSOL, nonzero accounts, mints backing an open
+position, mints with a liquidation in flight, and Token-2022 accounts whose extensions
+are not known-safe. Each batch is simulated before it is sent.
+\`\`\`
+Output (dry-run): { dry_run, wallet, sweep_all, candidates: [{ata, mint, owner, token_program, token_balance, rent_lamports, eligible, reason, code, extensions}], reclaimable_lamports }
+Output (live):    { dry_run:false, tx_signatures, summary, closed:[], skipped:[] }
+\`\`\`
+
 ### meridian swap --from <mint> --to <mint> --amount <n> [--dry-run]
 Swaps tokens via Jupiter. Use "SOL" as mint shorthand.
 \`\`\`
@@ -147,6 +158,9 @@ const { values: flags } = parseArgs({
     "bins-above": { type: "string" },
     "skip-swap":  { type: "boolean" },
     "dry-run":    { type: "boolean" },
+    "live":       { type: "boolean" },
+    "all":        { type: "boolean" },
+    "max-per-tx": { type: "string" },
     "silent":     { type: "boolean" },
     limit:        { type: "string" },
   },
@@ -304,6 +318,118 @@ switch (subcommand) {
       output_mint: flags.to,
       amount: parseFloat(flags.amount),
     }));
+    break;
+  }
+
+  // ── cleanup-empty-atas ───────────────────────────────────────────
+  // Reclaim rent from empty token accounts (F1). Dry-run by DEFAULT; sending requires
+  // an explicit --live. Never closes wSOL, an account backing an open position, a
+  // nonzero account, or a Token-2022 account whose extensions are not known-safe.
+  case "cleanup-empty-atas": {
+    // Sending requires an explicit --live AND that the global DRY_RUN kill switch is off.
+    const liveRequested = argv.includes("--live");
+    const blockedByDryRun = liveRequested && process.env.DRY_RUN === "true";
+    const live = liveRequested && !blockedByDryRun;
+    if (blockedByDryRun) {
+      process.stderr.write("[cleanup] --live ignored: DRY_RUN=true\n");
+    }
+    const { planCleanup, cleanupEmptyAtas } = await import("./tools/ata-cleanup.js");
+
+    // Never close an account whose mint backs a live LP position.
+    let activePositionMints = [];
+    try {
+      const { getMyPositions } = await import("./tools/dlmm.js");
+      const open = await getMyPositions({ force: true, silent: true });
+      activePositionMints = (open?.positions || []).map((p) => p.base_mint).filter(Boolean);
+    } catch (e) {
+      process.stderr.write(`[cleanup] could not read open positions (${e.message}); proceeding with none\n`);
+    }
+
+    // Mints with a liquidation in flight are kept out of the close set.
+    // bidask.mjs keeps its state at the REPO ROOT (../state.json from hands/).
+    let pendingLiquidationMints = [];
+    let lifecycleMints = [];
+    try {
+      const { repoPath } = await import("./repo-root.js");
+      const s = JSON.parse(fs.readFileSync(repoPath("..", "state.json"), "utf8"));
+      pendingLiquidationMints = Object.keys(s?.pendingSells || {});
+      for (const o of Object.values(s?.open || {})) if (o?.mint) lifecycleMints.push(String(o.mint));
+      lifecycleMints.push(...pendingLiquidationMints);
+    } catch { /* the bidask state file is optional */ }
+
+    // Anything this bot ever held: past performance records + the dust registry.
+    try {
+      const { repoPath } = await import("./repo-root.js");
+      const perf = JSON.parse(fs.readFileSync(repoPath("lessons.json"), "utf8"))?.performance || [];
+      for (const p of perf) if (p?.base_mint) lifecycleMints.push(String(p.base_mint));
+    } catch { /* optional */ }
+    try {
+      const { dustMints } = await import("./tools/dust-registry.js");
+      lifecycleMints.push(...dustMints());
+    } catch { /* optional */ }
+
+    lifecycleMints = [...new Set(lifecycleMints)].filter(Boolean);
+
+    // Requirement F1.6: do not close arbitrary token accounts outside the bot's own
+    // lifecycle. A full-wallet sweep must be asked for explicitly with --all.
+    const sweepAll = argv.includes("--all");
+    if (!sweepAll && lifecycleMints.length === 0) {
+      out({
+        dry_run: true,
+        wallet: null,
+        refused: true,
+        reason: "no lifecycle mints could be derived (empty position/lessons/dust state); refusing a blanket sweep",
+        hint: "re-run with --all to sweep every empty token account owned by the wallet",
+      });
+      break;
+    }
+    const allowedMints = sweepAll ? undefined : lifecycleMints;
+
+    const { wallet, candidates } = await planCleanup({ activePositionMints, pendingLiquidationMints, allowedMints });
+
+    if (!live) {
+      out({
+        dry_run: true,
+        wallet,
+        sweep_all: sweepAll,
+        lifecycle_mints: lifecycleMints.length,
+        active_position_mints: activePositionMints,
+        pending_liquidation_mints: pendingLiquidationMints,
+        candidates: candidates.map((c) => ({
+          ata: c.address,
+          mint: c.mint,
+          owner: c.owner,
+          token_program: c.program,
+          token_balance: String(c.balanceAtomic),
+          rent_lamports: String(c.rentLamports),
+          eligible: c.eligible,
+          reason: c.reason,
+          code: c.code,
+          extensions: c.extensions,
+        })),
+        reclaimable_lamports: String(candidates.filter((c) => c.eligible).reduce((a, c) => a + Number(c.rentLamports || 0), 0)),
+        message: "dry-run — nothing was sent. Re-run with --live to reclaim.",
+      });
+      break;
+    }
+
+    const result = await cleanupEmptyAtas({
+      dryRun: false,
+      allowLive: true,
+      activePositionMints,
+      pendingLiquidationMints,
+      allowedMints,
+      maxPerTx: flags["max-per-tx"] ? parseInt(flags["max-per-tx"]) : undefined,
+    });
+    out({
+      dry_run: false,
+      wallet: result.wallet,
+      tx_signatures: result.tx_signatures || [],
+      summary: result.summary,
+      closed: (result.results || []).filter((r) => r.closed).map((r) => ({ ata: r.address, mint: r.mint, rent_lamports: String(r.rentLamports), tx: r.tx_signature })),
+      skipped: (result.results || []).filter((r) => !r.closed).map((r) => ({ ata: r.address, mint: r.mint, code: r.code, reason: r.reason })),
+      error: result.error || null,
+    });
     break;
   }
 

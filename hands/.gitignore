@@ -3,3 +3,5 @@ node_modules/
 logs/
 *.log
 hivemind-cache.json
+dust-registry.json
+dust-registry.json.tmp

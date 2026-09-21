@@ -190,6 +190,18 @@ export const config = {
     repeatDeployCooldownMinFeeEarnedPct: u.repeatDeployCooldownMinFeeEarnedPct ?? u.repeatDeployCooldownMinFeeYieldPct ?? 0,
     minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
     maxSwapPriceImpactPct: u.maxSwapPriceImpactPct ?? 6, // quoted price impact above this splits the swap into 2 chunks
+    // ─── Execution-safety bounds (F3). NOT strategy parameters: they never change
+    // what/when/how much we trade, only whether a quoted route may be signed.
+    liquidationSlippageBps:          u.liquidationSlippageBps          ?? 300,   // 3% — conservative; clamps to [10, 2000]
+    rejectOnMissingPriceImpact:      u.rejectOnMissingPriceImpact      ?? true,  // missing impact is NOT proof of safety
+    swapFeeAllowanceLamports:        u.swapFeeAllowanceLamports        ?? 20000, // explicit network-fee allowance (base+priority)
+    liquidationSolDebitAllowanceLamports: u.liquidationSolDebitAllowanceLamports ?? 0, // extra native SOL a liquidation may debit
+    maxSwapRequotes:                 u.maxSwapRequotes                 ?? 1,     // re-quote attempts after a safety rejection; limits never loosen
+    // ─── Liquidation / rent handling (F1, F2)
+    dustFloorUsd:                    u.dustFloorUsd                    ?? 0.10,  // below this a balance is DUST (never "sold")
+    dustFloorAtomic:                 u.dustFloorAtomic                 ?? 10000, // used only when the USD price is unknown
+    reclaimAtaRentAfterClose:        u.reclaimAtaRentAfterClose        ?? true,  // close empty token accounts after a confirmed liquidation
+    maxAtaClosesPerTx:               u.maxAtaClosesPerTx               ?? 8,
     // Patient exit (fix #4, 2026-07-14): non-urgent swap-backs go out as Jupiter
     // Trigger (limit) orders at quote+offset instead of market sells.
     limitExitEnabled:        u.limitExitEnabled        ?? true,
