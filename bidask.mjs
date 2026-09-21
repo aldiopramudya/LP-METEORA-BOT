@@ -37,6 +37,32 @@ const LIVE = () => CONF.mode === "live";
 const tag = () => (LIVE() ? "BIDASK" : "BIDASK-DRY");
 const journal = (ev, o = {}) => appendJsonl(F.journal, { ts: new Date().toISOString(), ev, ...o });
 
+// Keep the integer amount returned by Solana as the source of truth. Rebuilding it
+// from uiAmount with a fixed 1e9 multiplier corrupts dust records for non-9-decimal
+// mints (and can also lose precision through floating-point arithmetic).
+export function parseTokenBalance(result) {
+  if (!Array.isArray(result?.value)) throw new Error("getTokenAccountsByOwner bentuk aneh");
+  let balanceAtomic = 0n;
+  let decimals = null;
+  for (const account of result.value) {
+    const tokenAmount = account?.account?.data?.parsed?.info?.tokenAmount;
+    const accountDecimals = Number(tokenAmount?.decimals);
+    const amount = tokenAmount?.amount;
+    if (!Number.isInteger(accountDecimals) || accountDecimals < 0 || !/^\d+$/.test(String(amount))) {
+      throw new Error("tokenAmount bentuk aneh");
+    }
+    if (decimals != null && decimals !== accountDecimals) throw new Error("decimals token tidak konsisten");
+    decimals = accountDecimals;
+    balanceAtomic += BigInt(amount);
+  }
+  return { amount: Number(balanceAtomic) / 10 ** (decimals ?? 0), balanceAtomic, decimals };
+}
+
+async function readTokenBalance(mint) {
+  const result = await rpc.call("getTokenAccountsByOwner", [WALLET, { mint }, { encoding: "jsonParsed", commitment: "confirmed" }]);
+  return parseTokenBalance(result);
+}
+
 // ── posisi: baca nilai (live via SDK, dry via simulasi harga) ────────────────
 async function readPosition(o) {
   if (!o.dry) return sdk.read(o, CONF.technical.oorBandPct);
@@ -203,7 +229,8 @@ async function sellPending(st) {
   for (const [mint, ps] of Object.entries(st.pendingSells)) {
     if (ps.nextTry && Date.now() < ps.nextTry) continue;
 
-    let bal; try { bal = await rpc.tokenBal(mint); } catch (e) { log(`pendingSell ${ps.sym}: ${e.message}`); continue; }
+    let balance; try { balance = await readTokenBalance(mint); } catch (e) { log(`pendingSell ${ps.sym}: ${e.message}`); continue; }
+    const bal = balance.amount;
 
     // KOSONG — bukan terjual, tapi tidak ada lagi yang bisa dijual. Reclaim rent-nya.
     if (bal <= 0) {
@@ -223,7 +250,7 @@ async function sellPending(st) {
 
     // Batas percobaan: sisa yang ga bisa dijual ga boleh jadi loop fee abadi.
     if ((ps.tries || 0) >= MAX_PENDING_TRIES) {
-      recordDust({ mint, symbol: ps.sym, balanceAtomic: Math.round(bal * 1e9),
+      recordDust({ mint, symbol: ps.sym, balanceAtomic: balance.balanceAtomic, decimals: balance.decimals,
         reason: `tidak bisa dijual setelah ${ps.tries}× percobaan`, position: null });
       await tg.send(`🧹 ${tag()}: sisa ${ps.sym} ditandai DUST setelah ${ps.tries}× (BUKAN terjual)`);
       delete st.pendingSells[mint];
@@ -241,7 +268,8 @@ async function sellPending(st) {
     }
 
     // Terjual (kata CLI). Hanya baca ulang on-chain yang boleh memutuskan.
-    let after; try { after = await rpc.tokenBal(mint); } catch (e) { log(`pendingSell ${ps.sym}: baca ulang gagal: ${e.message}`); continue; }
+    let afterBalance; try { afterBalance = await readTokenBalance(mint); } catch (e) { log(`pendingSell ${ps.sym}: baca ulang gagal: ${e.message}`); continue; }
+    const after = afterBalance.amount;
     if (after <= 0) {
       log(`pendingSell ${ps.sym}: SOLD bersih ${bal}`);
       await tg.send(`🧹 ${tag()}: sisa token ${ps.sym} kejual (${ps.why})`);
@@ -253,7 +281,7 @@ async function sellPending(st) {
 
     // Sisa sedikit setelah penjualan = DUST, bukan "belum selesai".
     if (bal > 0 && after / bal < RESIDUAL_DUST_RATIO) {
-      recordDust({ mint, symbol: ps.sym, balanceAtomic: Math.round(after * 1e9),
+      recordDust({ mint, symbol: ps.sym, balanceAtomic: afterBalance.balanceAtomic, decimals: afterBalance.decimals,
         reason: `sisa ${after} setelah menjual ${bal} — dust, bukan terjual penuh`, position: null });
       log(`pendingSell ${ps.sym}: sisa ${after} ditandai DUST — berhenti retry`);
       delete st.pendingSells[mint];
