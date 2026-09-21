@@ -4,7 +4,7 @@
 // MODE dry: semua jalan (screening, keputusan, catatan) kecuali kirim tx — posisi disimulasikan dari harga pool.
 import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { log, sleep, num, round, hoursSince, readEnv, readJson, writeJsonAtomic, appendJsonl, withTimeout } from "./lib/util.mjs";
 import { Rpc } from "./lib/rpc.mjs";
 import { Sdk } from "./lib/sdk.mjs";
@@ -13,7 +13,6 @@ import { State } from "./lib/state.mjs";
 import { Tg } from "./lib/tg.mjs";
 import { discover, poolDetail, priceChange, solUsd } from "./lib/meteora.mjs";
 import { screen, binsFor, sizeFor, exitDecision } from "./lib/rules.mjs";
-import { recordDust, clearDust, getDust } from "./hands/tools/dust-registry.js";
 
 const DIR = dirname(fileURLToPath(import.meta.url));
 const OPS = join(DIR, "..");
@@ -22,6 +21,10 @@ const A2_DIR = CONF0.handsDir;   // "tangan" (cli.js meridian) + .env wallet —
 const WALLET = CONF0.wallet;
 if (!A2_DIR || !WALLET) throw new Error("config.json butuh handsDir & wallet");
 const F = { conf: join(DIR, "config.json"), state: join(DIR, "state.json"), results: join(DIR, "results.jsonl"), hb: join(DIR, "heartbeat.json"), journal: join(DIR, "journal.jsonl") };
+// F2 dust registry hidup di folder hands (bisa terpisah dari folder ini — lihat handsDir), jadi diimport dari A2_DIR, bukan relatif.
+const { recordDust, clearDust, getDust } = await import(pathToFileURL(join(A2_DIR, "tools", "dust-registry.js")).href);
+// cli.js cleanup-empty-atas butuh state bidask (pendingSells/open) buat lindungi mint yang lagi dilikuidasi.
+process.env.BIDASK_STATE_FILE = F.state;
 
 let CONF = readJson(F.conf);
 const rpc = new Rpc([readEnv(`${A2_DIR}/.env`, "RPC_URL"), readEnv(`${A2_DIR}/.env`, "RPC_URL_FALLBACK")], WALLET);

@@ -351,7 +351,7 @@ switch (subcommand) {
     let lifecycleMints = [];
     try {
       const { repoPath } = await import("./repo-root.js");
-      const s = JSON.parse(fs.readFileSync(repoPath("..", "state.json"), "utf8"));
+      const s = JSON.parse(fs.readFileSync(process.env.BIDASK_STATE_FILE || repoPath("..", "state.json"), "utf8"));
       pendingLiquidationMints = Object.keys(s?.pendingSells || {});
       for (const o of Object.values(s?.open || {})) if (o?.mint) lifecycleMints.push(String(o.mint));
       lifecycleMints.push(...pendingLiquidationMints);
