@@ -150,6 +150,10 @@ export async function planCleanup({ owner, activePositionMints = [], pendingLiqu
 function buildCloseTransactions(chunks, ownerKey) {
   return chunks.map((chunk) => {
     const tx = new Transaction();
+    // simulateTransaction() on a legacy Transaction compiles the message first and throws
+    // "Transaction fee payer required" unless the payer is set explicitly (sendAndConfirm
+    // would set it from the signer, but the simulation runs before that).
+    tx.feePayer = ownerKey;
     for (const c of chunk) {
       tx.add(new TransactionInstruction({
         programId: new PublicKey(c.program),
