@@ -32,6 +32,7 @@ const assertPubkey = (s) => { new PublicKey(s); return s; };
 import { appendDecision } from "../decision-log.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
+import { sendDlmmCloseTransaction } from "./dlmm-close.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -1923,6 +1924,25 @@ export async function closePosition({ position_address, reason }) {
       log("close_warn", `Could not check liquidity state: ${e.message}`);
     }
 
+    let closePartiallyLanded = false;
+    const sendCloseTransaction = async (tx) => {
+      // Confirmation can expire after the validator accepted the transaction. Re-read
+      // before retrying so an already-emptied LP is not withdrawn/accounted twice.
+      return sendDlmmCloseTransaction({
+        connection: getConnection(),
+        tx,
+        wallet,
+        pool,
+        positionPubKey,
+        sendTransaction: sendAndConfirmTransaction,
+        onReadError: (error) => log("close_warn", `Expired close liquidity re-read failed: ${error.message}`),
+        onPartial: () => {
+          closePartiallyLanded = true;
+          log("close_warn", `Close confirmation expired, but ${position_address} now has zero liquidity; treating withdrawal as landed/partial success`);
+        },
+      });
+    };
+
     if (hasLiquidity) {
       log("close", `Step 2: Removing liquidity and closing account`);
       const closeTx = await pool.removeLiquidity({
@@ -1935,8 +1955,9 @@ export async function closePosition({ position_address, reason }) {
       });
 
       for (const tx of Array.isArray(closeTx) ? closeTx : [closeTx]) {
-        const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
-        closeTxHashes.push(txHash);
+        const txHash = await sendCloseTransaction(tx);
+        if (txHash) closeTxHashes.push(txHash);
+        if (closePartiallyLanded) break;
       }
     } else {
       log("close", `Step 2: No position liquidity detected, closing account`);
@@ -1944,8 +1965,8 @@ export async function closePosition({ position_address, reason }) {
         owner: wallet.publicKey,
         position: { publicKey: positionPubKey },
       });
-      const txHash = await sendAndConfirmTransaction(getConnection(), closeTx, [wallet]);
-      closeTxHashes.push(txHash);
+      const txHash = await sendCloseTransaction(closeTx);
+      if (txHash) closeTxHashes.push(txHash);
     }
     const txHashes = [...claimTxHashes, ...closeTxHashes];
     const closeGasSol = await getTxFeesSol(txHashes);
@@ -2136,6 +2157,7 @@ export async function closePosition({ position_address, reason }) {
 
       return {
         success: true,
+        partial_close: closePartiallyLanded,
         position: position_address,
         pool: poolAddress,
         pool_name: tracked.pool_name || poolMeta.name || null,
@@ -2163,6 +2185,7 @@ export async function closePosition({ position_address, reason }) {
 
     return {
       success: true,
+      partial_close: closePartiallyLanded,
       position: position_address,
       pool: poolAddress,
       pool_name: poolMeta.name || null,
