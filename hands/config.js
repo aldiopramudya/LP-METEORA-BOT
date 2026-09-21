@@ -194,7 +194,10 @@ export const config = {
     // what/when/how much we trade, only whether a quoted route may be signed.
     liquidationSlippageBps:          u.liquidationSlippageBps          ?? 300,   // 3% — conservative; clamps to [10, 2000]
     rejectOnMissingPriceImpact:      u.rejectOnMissingPriceImpact      ?? true,  // missing impact is NOT proof of safety
-    swapFeeAllowanceLamports:        u.swapFeeAllowanceLamports        ?? 20000, // explicit network-fee allowance (base+priority)
+    // Fee allowance is the transaction's RPC fee quote (base + encoded priority fee).
+    // The ceiling is a fail-closed spend bound, not a fixed assumed fee. No extra fee
+    // buffer is credited toward output because that would weaken minimum-output checks.
+    maxSwapFeeLamports:              u.maxSwapFeeLamports              ?? 10_000_000,
     liquidationSolDebitAllowanceLamports: u.liquidationSolDebitAllowanceLamports ?? 0, // extra native SOL a liquidation may debit
     maxSwapRequotes:                 u.maxSwapRequotes                 ?? 1,     // re-quote attempts after a safety rejection; limits never loosen
     // ─── Liquidation / rent handling (F1, F2)

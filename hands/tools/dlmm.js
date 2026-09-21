@@ -32,6 +32,7 @@ const assertPubkey = (s) => { new PublicKey(s); return s; };
 import { appendDecision } from "../decision-log.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
+import { sendDlmmCloseTransaction } from "./dlmm-close.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -87,6 +88,198 @@ function getConnection() {
     _connection = new Connection(process.env.RPC_URL, "confirmed");
   }
   return _connection;
+}
+
+export function isAmbiguousDlmmConfirmationError(error) {
+  const name = String(error?.name || "").toLowerCase();
+  const message = String(error?.message || error || "").toLowerCase();
+  return name.includes("transactionexpired") ||
+    name.includes("timeouterror") ||
+    message.includes("block height exceeded") ||
+    message.includes("block height has been exceeded") ||
+    message.includes("blockheight exceeded") ||
+    message.includes("last valid block height") ||
+    message.includes("confirmation expired") ||
+    message.includes("not confirmed before") ||
+    message.includes("timed out awaiting confirmation");
+}
+
+function isExpiredDlmmBlockheightError(error) {
+  const name = String(error?.name || "").toLowerCase();
+  const message = String(error?.message || error || "").toLowerCase();
+  return name.includes("blockheightexceeded") ||
+    message.includes("block height exceeded") ||
+    message.includes("block height has been exceeded") ||
+    message.includes("blockheight exceeded") ||
+    message.includes("last valid block height");
+}
+
+function signedTransactionSignature(tx) {
+  const bytes = tx?.signature || tx?.signatures?.[0];
+  if (!bytes) return null;
+  try {
+    const signature = bs58.encode(Buffer.from(bytes));
+    return /^1+$/.test(signature) ? null : signature;
+  } catch {
+    return null;
+  }
+}
+
+async function signatureLanded(connection, signature) {
+  if (!signature || typeof connection?.getSignatureStatuses !== "function") return false;
+  const response = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
+  const status = response?.value?.[0];
+  return Boolean(status && status.err == null);
+}
+
+/**
+ * Resolve an ambiguous confirmation from chain state. A replacement transaction is
+ * allowed only after blockheight expiry and a conclusive state re-read says the
+ * previous attempt did not land. Timeouts are never retried because they can still
+ * land under their original blockhash.
+ */
+export async function sendDlmmTransactionWithReconciliation({
+  connection,
+  tx,
+  signers,
+  reconcile,
+  sendTransaction = sendAndConfirmTransaction,
+  maxExpiredRetries = 1,
+}) {
+  let expiredRetries = 0;
+  while (true) {
+    try {
+      return await sendTransaction(connection, tx, signers);
+    } catch (error) {
+      if (!isAmbiguousDlmmConfirmationError(error)) throw error;
+
+      let reconciled = null;
+      if (typeof reconcile === "function") {
+        try {
+          const outcome = await reconcile();
+          if (outcome === true) return signedTransactionSignature(tx);
+          if (outcome === false) reconciled = false;
+        } catch {
+          // An unavailable state read is not proof that retrying is safe.
+        }
+      }
+
+      const signature = signedTransactionSignature(tx);
+      try {
+        if (await signatureLanded(connection, signature)) return signature;
+      } catch {
+        // Preserve the original error unless state reconciliation proved a retry safe.
+      }
+
+      const canRetry = isExpiredDlmmBlockheightError(error) &&
+        reconciled === false &&
+        expiredRetries < maxExpiredRetries;
+      if (!canRetry) throw error;
+      expiredRetries += 1;
+    }
+  }
+}
+
+function dlmmPositionLiquidity(position) {
+  const bins = position?.positionData?.positionBinData;
+  if (!Array.isArray(bins)) return null;
+  try {
+    return bins.reduce(
+      (total, bin) => total + BigInt(bin?.positionLiquidity?.toString?.() ?? bin?.positionLiquidity ?? 0),
+      0n,
+    );
+  } catch {
+    return null;
+  }
+}
+
+async function readDlmmPositionLiquidity(pool, positionPubKey) {
+  return dlmmPositionLiquidity(await pool.getPosition(positionPubKey));
+}
+
+async function readAccountDataSnapshot(connection, publicKey) {
+  const account = await connection.getAccountInfo(publicKey, "confirmed");
+  return account ? Buffer.from(account.data).toString("base64") : null;
+}
+
+export async function accountDataChanged(connection, publicKey, before) {
+  return await readAccountDataSnapshot(connection, publicKey) !== before;
+}
+
+/** Claim-fee sends mutate the position account, so snapshot it before any safe retry. */
+export async function sendDlmmClaimTransactionWithReconciliation({
+  connection,
+  tx,
+  signers,
+  positionPubKey,
+  sendTransaction = sendAndConfirmTransaction,
+}) {
+  const beforePosition = await readAccountDataSnapshot(connection, positionPubKey);
+  if (beforePosition == null) {
+    throw new Error("Cannot snapshot DLMM position before fee claim; refusing transaction.");
+  }
+  return sendDlmmTransactionWithReconciliation({
+    connection,
+    tx,
+    signers,
+    sendTransaction,
+    reconcile: () => accountDataChanged(connection, positionPubKey, beforePosition),
+  });
+}
+
+/** Resolve a close whose position read fails because the landed tx deleted the account. */
+export async function sendDlmmCloseWithAccountReconciliation({
+  connection,
+  tx,
+  wallet,
+  pool,
+  positionPubKey,
+  sendTransaction = sendAndConfirmTransaction,
+  onReadError,
+  onPartial,
+  requireAccountDeletionOnPartial = false,
+}) {
+  let sendError = null;
+  let partial = false;
+  try {
+    const signature = await sendDlmmCloseTransaction({
+      connection,
+      tx,
+      wallet,
+      pool,
+      positionPubKey,
+      sendTransaction: async (...args) => {
+        try {
+          return await sendTransaction(...args);
+        } catch (error) {
+          sendError = error;
+          throw error;
+        }
+      },
+      onReadError,
+      onPartial: () => { partial = true; },
+    });
+    if (partial && requireAccountDeletionOnPartial) {
+      const accountInfo = await connection.getAccountInfo(positionPubKey, "confirmed");
+      if (accountInfo != null) throw sendError;
+    }
+    if (partial) onPartial?.();
+    return signature;
+  } catch (error) {
+    if (!isAmbiguousDlmmConfirmationError(error)) throw error;
+
+    let accountInfo;
+    try {
+      accountInfo = await connection.getAccountInfo(positionPubKey, "confirmed");
+    } catch (readError) {
+      onReadError?.(readError);
+      throw error;
+    }
+    if (accountInfo != null) throw error;
+
+    onPartial?.();
+    return signedTransactionSignature(tx);
+  }
 }
 
 // Sums actual network fee (lamports) paid across a set of confirmed tx
@@ -932,8 +1125,18 @@ export async function deployPosition({
       const createTxArray = Array.isArray(createTxs) ? createTxs : [createTxs];
       for (let i = 0; i < createTxArray.length; i++) {
         const signers = i === 0 ? [wallet, newPosition] : [wallet];
-        const txHash = await sendAndConfirmTransaction(getConnection(), createTxArray[i], signers);
-        txHashes.push(txHash);
+        const connection = getConnection();
+        // Every extended-position transaction can mutate the position account. Capture
+        // its exact pre-send state so confirmation expiry can be resolved without
+        // submitting the same non-idempotent creation step again.
+        const beforePosition = await readAccountDataSnapshot(connection, newPosition.publicKey);
+        const txHash = await sendDlmmTransactionWithReconciliation({
+          connection,
+          tx: createTxArray[i],
+          signers,
+          reconcile: () => accountDataChanged(connection, newPosition.publicKey, beforePosition),
+        });
+        if (txHash) txHashes.push(txHash);
         log("deploy", `Create tx ${i + 1}/${createTxArray.length}: ${txHash}`);
       }
 
@@ -948,8 +1151,17 @@ export async function deployPosition({
       });
       const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
       for (let i = 0; i < addTxArray.length; i++) {
-        const txHash = await sendAndConfirmTransaction(getConnection(), addTxArray[i], [wallet]);
-        txHashes.push(txHash);
+        const beforeLiquidity = await readDlmmPositionLiquidity(pool, newPosition.publicKey);
+        const txHash = await sendDlmmTransactionWithReconciliation({
+          connection: getConnection(),
+          tx: addTxArray[i],
+          signers: [wallet],
+          reconcile: async () => {
+            const afterLiquidity = await readDlmmPositionLiquidity(pool, newPosition.publicKey);
+            return beforeLiquidity != null && afterLiquidity != null && afterLiquidity !== beforeLiquidity;
+          },
+        });
+        if (txHash) txHashes.push(txHash);
         log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
       }
     } else {
@@ -962,8 +1174,14 @@ export async function deployPosition({
         strategy: { maxBinId, minBinId, strategyType },
         slippage: 1000, // 10% in bps
       });
-      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet, newPosition]);
-      txHashes.push(txHash);
+      const connection = getConnection();
+      const txHash = await sendDlmmTransactionWithReconciliation({
+        connection,
+        tx,
+        signers: [wallet, newPosition],
+        reconcile: async () => (await connection.getAccountInfo(newPosition.publicKey, "confirmed")) != null,
+      });
+      if (txHash) txHashes.push(txHash);
     }
 
     log("deploy", `SUCCESS — ${txHashes.length} tx(s): ${txHashes[0]}`);
@@ -1620,8 +1838,14 @@ export async function claimFees({ position_address }) {
 
     const txHashes = [];
     for (const tx of txs) {
-      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
-      txHashes.push(txHash);
+      const connection = getConnection();
+      const txHash = await sendDlmmClaimTransactionWithReconciliation({
+        connection,
+        tx,
+        signers: [wallet],
+        positionPubKey: new PublicKey(position_address),
+      });
+      if (txHash) txHashes.push(txHash);
     }
     log("claim", `SUCCESS txs: ${txHashes.join(", ")}`);
     _positionsCacheAt = 0; // invalidate cache after claim
@@ -1896,8 +2120,14 @@ export async function closePosition({ position_address, reason }) {
         });
         if (claimTxs && claimTxs.length > 0) {
           for (const tx of claimTxs) {
-            const claimHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
-            claimTxHashes.push(claimHash);
+            const connection = getConnection();
+            const claimHash = await sendDlmmClaimTransactionWithReconciliation({
+              connection,
+              tx,
+              signers: [wallet],
+              positionPubKey,
+            });
+            if (claimHash) claimTxHashes.push(claimHash);
           }
           log("close", `Step 1 OK (claim only): ${claimTxHashes.join(", ")}`);
         }
@@ -1923,6 +2153,26 @@ export async function closePosition({ position_address, reason }) {
       log("close_warn", `Could not check liquidity state: ${e.message}`);
     }
 
+    let closePartiallyLanded = false;
+    const sendCloseTransaction = async (tx) => {
+      // Confirmation can expire after the validator accepted the transaction. Re-read
+      // before retrying so an already-emptied LP is not withdrawn/accounted twice.
+      return sendDlmmCloseWithAccountReconciliation({
+        connection: getConnection(),
+        tx,
+        wallet,
+        pool,
+        positionPubKey,
+        sendTransaction: sendAndConfirmTransaction,
+        onReadError: (error) => log("close_warn", `Expired close liquidity re-read failed: ${error.message}`),
+        onPartial: () => {
+          closePartiallyLanded = true;
+          log("close_warn", `Close confirmation expired, but ${position_address} now has zero liquidity; treating withdrawal as landed/partial success`);
+        },
+        requireAccountDeletionOnPartial: !hasLiquidity,
+      });
+    };
+
     if (hasLiquidity) {
       log("close", `Step 2: Removing liquidity and closing account`);
       const closeTx = await pool.removeLiquidity({
@@ -1935,8 +2185,9 @@ export async function closePosition({ position_address, reason }) {
       });
 
       for (const tx of Array.isArray(closeTx) ? closeTx : [closeTx]) {
-        const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
-        closeTxHashes.push(txHash);
+        const txHash = await sendCloseTransaction(tx);
+        if (txHash) closeTxHashes.push(txHash);
+        if (closePartiallyLanded) break;
       }
     } else {
       log("close", `Step 2: No position liquidity detected, closing account`);
@@ -1944,8 +2195,8 @@ export async function closePosition({ position_address, reason }) {
         owner: wallet.publicKey,
         position: { publicKey: positionPubKey },
       });
-      const txHash = await sendAndConfirmTransaction(getConnection(), closeTx, [wallet]);
-      closeTxHashes.push(txHash);
+      const txHash = await sendCloseTransaction(closeTx);
+      if (txHash) closeTxHashes.push(txHash);
     }
     const txHashes = [...claimTxHashes, ...closeTxHashes];
     const closeGasSol = await getTxFeesSol(txHashes);
@@ -2136,6 +2387,7 @@ export async function closePosition({ position_address, reason }) {
 
       return {
         success: true,
+        partial_close: closePartiallyLanded,
         position: position_address,
         pool: poolAddress,
         pool_name: tracked.pool_name || poolMeta.name || null,
@@ -2163,6 +2415,7 @@ export async function closePosition({ position_address, reason }) {
 
     return {
       success: true,
+      partial_close: closePartiallyLanded,
       position: position_address,
       pool: poolAddress,
       pool_name: poolMeta.name || null,

@@ -1,11 +1,4 @@
-import {
-  Connection,
-  PublicKey,
-  LAMPORTS_PER_SOL,
-  VersionedTransaction,
-  Keypair,
-} from "@solana/web3.js";
-import bs58 from "bs58";
+import { createRequire } from "node:module";
 import { log } from "../logger.js";
 import { config } from "../config.js";
 import {
@@ -18,19 +11,43 @@ import {
 } from "./swap-guard.js";
 import { STATUS } from "./liquidation-status.js";
 
+// Keep production-only Solana dependencies out of the pure helper import path. The
+// repository's unit-test environment intentionally does not install them, while live
+// wallet operations still load the same packages synchronously on first use.
+const require = createRequire(import.meta.url);
+let _solanaWeb3 = null;
+let _bs58 = null;
+
+function getSolanaWeb3() {
+  if (!_solanaWeb3) _solanaWeb3 = require("@solana/web3.js");
+  return _solanaWeb3;
+}
+
+function getBs58() {
+  if (!_bs58) {
+    const mod = require("bs58");
+    _bs58 = mod.default || mod;
+  }
+  return _bs58;
+}
+
 // Exported at bottom for limit-exit.js (patient exit orders need signing + API key).
 let _connection = null;
 let _wallet = null;
 
 function getConnection() {
-  if (!_connection) _connection = new Connection(process.env.RPC_URL, "confirmed");
+  if (!_connection) {
+    const { Connection } = getSolanaWeb3();
+    _connection = new Connection(process.env.RPC_URL, "confirmed");
+  }
   return _connection;
 }
 
 function getWallet() {
   if (!_wallet) {
     if (!process.env.WALLET_PRIVATE_KEY) throw new Error("WALLET_PRIVATE_KEY not set");
-    _wallet = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY));
+    const { Keypair } = getSolanaWeb3();
+    _wallet = Keypair.fromSecretKey(getBs58().decode(process.env.WALLET_PRIVATE_KEY));
   }
   return _wallet;
 }
@@ -57,6 +74,7 @@ function getJupiterReferralParams() {
     return null;
   }
   try {
+    const { PublicKey } = getSolanaWeb3();
     new PublicKey(referralAccount);
   } catch {
     log("swap_warn", "Ignoring invalid Jupiter referral account");
@@ -140,6 +158,154 @@ export async function getWalletBalances() {
  */
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
+/**
+ * Use the transaction's RPC fee quote as the simulation accounting allowance while
+ * retaining an absolute spend ceiling. `getFeeForMessage` includes the base signature
+ * fee and any compute-unit priority fee encoded in the Jupiter transaction, so this is
+ * fee-aware without crediting an arbitrary buffer toward the swap's minimum output.
+ */
+export function boundedSwapFeeAllowance(estimatedFeeLamports, {
+  maxFeeLamports = 10_000_000,
+  walletPaysFee = true,
+} = {}) {
+  // Ultra can return gasless transactions whose fee payer is not the taker. In that
+  // case none of the transaction fee may be added back to the taker's simulated SOL
+  // delta; doing so could make a below-minimum output appear safe.
+  if (!walletPaysFee) return 0;
+  const estimate = estimatedFeeLamports == null ? NaN : Number(estimatedFeeLamports);
+  const ceiling = Number(maxFeeLamports);
+  if (!Number.isSafeInteger(estimate) || estimate <= 0) {
+    throw new Error("RPC returned no usable transaction fee quote; refusing to assume a fee");
+  }
+  if (!Number.isSafeInteger(ceiling) || ceiling <= 0) {
+    throw new Error("Invalid bounded swap fee configuration");
+  }
+  if (estimate > ceiling) {
+    throw new Error(`Quoted swap fee ${estimate} lamports exceeds ceiling ${ceiling}`);
+  }
+  return estimate;
+}
+
+/** Prove the order carries the requested slippage bound using response evidence. */
+export function verifyJupiterSlippageBinding(order, requestedSlippageBps) {
+  const requested = Number(requestedSlippageBps);
+  const applied = Number(order?.slippageBps);
+  if (!Number.isInteger(requested) || requested <= 0 || requested >= 10_000) {
+    return {
+      bound: false,
+      evidence: null,
+      reason: `requested slippage ${String(requestedSlippageBps)} bps is invalid`,
+      minimumOutAtomic: null,
+      thresholdAtomic: null,
+      appliedSlippageBps: Number.isFinite(applied) ? applied : null,
+    };
+  }
+  // `otherAmountThreshold` is a minimum output only for ExactIn orders, and an echoed
+  // slippage value has different semantics for ExactOut. Jupiter exposes `swapMode` in
+  // the order response, so require that evidence rather than relying on an API default.
+  if (order?.swapMode !== "ExactIn") {
+    return {
+      bound: false,
+      evidence: null,
+      reason: `Jupiter order does not prove ExactIn swap mode (${String(order?.swapMode)})`,
+      minimumOutAtomic: null,
+      thresholdAtomic: null,
+      appliedSlippageBps: Number.isFinite(applied) ? applied : null,
+    };
+  }
+  let requiredMin = null;
+  try {
+    const rawOut = order?.outAmount;
+    if ((typeof rawOut === "string" && /^\d+$/.test(rawOut)) || typeof rawOut === "bigint") {
+      const out = BigInt(rawOut);
+      if (out > 0n) requiredMin = (out * BigInt(10_000 - requested)) / 10_000n;
+    } else if (Number.isSafeInteger(rawOut) && rawOut > 0) {
+      const out = BigInt(rawOut);
+      requiredMin = (out * BigInt(10_000 - requested)) / 10_000n;
+    }
+    if (requiredMin === 0n) requiredMin = 1n;
+  } catch { /* unusable response field */ }
+  const hasThreshold = order?.otherAmountThreshold != null && order.otherAmountThreshold !== "";
+  let threshold = null;
+  try {
+    const rawThreshold = order?.otherAmountThreshold;
+    if ((typeof rawThreshold === "string" && /^\d+$/.test(rawThreshold)) || typeof rawThreshold === "bigint") {
+      threshold = BigInt(rawThreshold);
+    } else if (Number.isSafeInteger(rawThreshold) && rawThreshold >= 0) {
+      threshold = BigInt(rawThreshold);
+    }
+  } catch { /* unusable response field */ }
+  if (hasThreshold && (requiredMin == null || threshold == null || threshold < requiredMin)) {
+    return {
+      bound: false,
+      evidence: null,
+      reason: `order minimum-output threshold does not bind requested slippage ${requested} bps`,
+      minimumOutAtomic: requiredMin?.toString() ?? null,
+      thresholdAtomic: threshold?.toString() ?? null,
+      appliedSlippageBps: Number.isFinite(applied) ? applied : null,
+    };
+  }
+  if (requiredMin != null && threshold != null) {
+    return {
+      bound: true,
+      evidence: "otherAmountThreshold",
+      minimumOutAtomic: requiredMin.toString(),
+      thresholdAtomic: threshold.toString(),
+    };
+  }
+  if (Number.isInteger(applied) && applied > 0 && applied <= requested) {
+    return { bound: true, evidence: "slippageBps", appliedSlippageBps: applied };
+  }
+  return {
+    bound: false,
+    evidence: null,
+    reason: `order does not prove requested slippage ${requested} bps is bound`,
+    minimumOutAtomic: requiredMin?.toString() ?? null,
+    thresholdAtomic: threshold?.toString() ?? null,
+    appliedSlippageBps: Number.isFinite(applied) ? applied : null,
+  };
+}
+
+export function isAmbiguousExecutionError(error) {
+  const text = String(error?.message || error || "").toLowerCase();
+  const status = Number(error?.status || 0);
+  return status >= 500 || status === 408 || status === 429 ||
+    text.includes("block height") || text.includes("blockheight") ||
+    text.includes("expired") || text.includes("timeout") ||
+    text.includes("aborted") || text.includes("fetch failed") || text.includes("network");
+}
+
+async function readSignatureLanded(connection, signature) {
+  try {
+    const response = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
+    const status = response?.value?.[0];
+    return status && !status.err && ["confirmed", "finalized"].includes(status.confirmationStatus)
+      ? true
+      : status?.err ? false : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Wait until an ambiguous signed swap is observed or its blockhash can no longer land. */
+async function reconcileAmbiguousSwap(connection, signature, lastValidBlockHeight) {
+  const lastValid = Number(lastValidBlockHeight);
+  for (;;) {
+    const landed = await readSignatureLanded(connection, signature);
+    if (landed !== null) return { landed, expired: false };
+    if (Number.isFinite(lastValid)) {
+      try {
+        if (await connection.getBlockHeight("confirmed") > lastValid) {
+          return { landed: false, expired: true };
+        }
+      } catch { /* retain ambiguity and retry the read */ }
+    } else {
+      return { landed: false, expired: false, unknown: true };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+}
+
 /** Token programs enumerated when snapshotting wallet token state for the simulation gate. */
 const TOKEN_PROGRAMS_FOR_SNAPSHOT = [
   "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -166,6 +332,7 @@ export function normalizeMint(mint) {
  * Used as the "before" side of the pre/post simulation comparison.
  */
 async function snapshotWalletTokenState(connection, owner) {
+  const { PublicKey } = getSolanaWeb3();
   const ownerKey = owner instanceof PublicKey ? owner : new PublicKey(owner);
   const preTokenAccounts = {};
   const addresses = [];
@@ -198,6 +365,7 @@ async function snapshotWalletTokenState(connection, owner) {
  * producing a false failure.
  */
 async function simulateSwapEffects(connection, owner, transaction, snapshot, feeAllowanceLamports) {
+  const { PublicKey } = getSolanaWeb3();
   const ownerStr = owner instanceof PublicKey ? owner.toString() : String(owner);
   const addressOrder = [ownerStr, ...snapshot.tokenAddresses];
   let res;
@@ -234,6 +402,7 @@ async function simulateSwapEffects(connection, owner, transaction, snapshot, fee
  */
 export async function getOnChainTokenBalanceAtomic(owner, mint) {
   const connection = getConnection();
+  const { PublicKey } = getSolanaWeb3();
   const ownerKey = owner instanceof PublicKey ? owner : new PublicKey(owner);
   try {
     for (const programId of TOKEN_PROGRAMS_FOR_SNAPSHOT) {
@@ -272,6 +441,7 @@ export async function swapToken({
     log("swap", `${amount} of ${input_mint} → ${output_mint}`);
     const wallet = getWallet();
     const connection = getConnection();
+    const { PublicKey, VersionedTransaction } = getSolanaWeb3();
 
     // ─── Convert to smallest unit ──────────────────────────────
     let decimals = 9; // SOL default
@@ -287,7 +457,6 @@ export async function swapToken({
     const direction = swapDirection(input_mint, output_mint);
     const slippageBps = resolveSlippageBps(config.management.liquidationSlippageBps);
     const maxImpactPct = Number(config.management.maxSwapPriceImpactPct ?? 6);
-    const feeAllowanceLamports = Math.max(0, Math.trunc(Number(config.management.swapFeeAllowanceLamports ?? 20000)));
     const temporarySolDebitLamports = Math.max(0, Math.trunc(Number(config.management.liquidationSolDebitAllowanceLamports ?? 0)));
     const rejectOnMissingPriceImpact = config.management.rejectOnMissingPriceImpact !== false;
     const maxRequotes = Math.max(0, Math.trunc(Number(config.management.maxSwapRequotes ?? 1)));
@@ -318,6 +487,10 @@ export async function swapToken({
       if (o.errorCode || o.errorMessage) {
         throw new Error(`Swap V2 order error: ${o.errorMessage || o.errorCode}`);
       }
+      const slippageBinding = verifyJupiterSlippageBinding(o, slippageBps);
+      if (!slippageBinding.bound) {
+        throw new Error(`Swap V2 order rejected: ${slippageBinding.reason}`);
+      }
       return o;
     };
 
@@ -347,6 +520,14 @@ export async function swapToken({
     let tx = null;
     for (let attempt = 0; ; attempt++) {
       tx = VersionedTransaction.deserialize(Buffer.from(order.transaction, "base64"));
+      const walletPaysFee = tx.message.staticAccountKeys[0]?.equals(wallet.publicKey) === true;
+      const feeQuote = walletPaysFee
+        ? await connection.getFeeForMessage(tx.message, "confirmed")
+        : null;
+      const feeAllowanceLamports = boundedSwapFeeAllowance(feeQuote?.value, {
+        maxFeeLamports: config.management.maxSwapFeeLamports,
+        walletPaysFee,
+      });
       const { simulate } = await simulateSwapEffects(
         connection, wallet.publicKey, tx, snapshot, feeAllowanceLamports,
       );
@@ -413,23 +594,47 @@ export async function swapToken({
     tx.sign([wallet]);
     const signedTx = Buffer.from(tx.serialize()).toString("base64");
     const requestId = order.requestId;
+    const localSignature = getBs58().encode(tx.signatures[0]);
 
     // ─── Execute ───────────────────────────────────────────────
-    const execRes = await fetch(`${JUPITER_SWAP_V2_API}/execute`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(jupiterApiKey ? { "x-api-key": jupiterApiKey } : {}),
-      },
-      body: JSON.stringify({ signedTransaction: signedTx, requestId }),
-    });
-    if (!execRes.ok) {
-      throw new Error(`Swap V2 execute failed: ${execRes.status} ${await execRes.text()}`);
-    }
-
-    const result = await execRes.json();
-    if (result.status === "Failed") {
-      throw new Error(`Swap failed on-chain: code=${result.code}`);
+    let result;
+    try {
+      const execRes = await fetch(`${JUPITER_SWAP_V2_API}/execute`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(jupiterApiKey ? { "x-api-key": jupiterApiKey } : {}),
+        },
+        body: JSON.stringify({ signedTransaction: signedTx, requestId }),
+      });
+      if (!execRes.ok) {
+        const error = new Error(`Swap V2 execute failed: ${execRes.status} ${await execRes.text()}`);
+        error.status = execRes.status;
+        throw error;
+      }
+      result = await execRes.json();
+      if (result.status === "Failed") {
+        throw new Error(`Swap failed on-chain: code=${result.code}`);
+      }
+    } catch (error) {
+      if (!isAmbiguousExecutionError(error)) throw error;
+      const reconciled = await reconcileAmbiguousSwap(
+        connection,
+        localSignature,
+        order.lastValidBlockHeight,
+      );
+      if (!reconciled.landed) {
+        if (reconciled.unknown) {
+          const unresolved = new Error(
+            `Swap execution is ambiguous for ${localSignature}; refusing to issue a replacement transaction`,
+          );
+          unresolved.retrySafe = false;
+          throw unresolved;
+        }
+        throw error;
+      }
+      log("swap_warn", `Execute response was ambiguous, but signature ${localSignature} is confirmed on-chain`);
+      result = { status: "Success", signature: localSignature, reconciled: true };
     }
 
     log("swap", `SUCCESS tx: ${result.signature}`);

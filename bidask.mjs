@@ -13,6 +13,7 @@ import { State } from "./lib/state.mjs";
 import { Tg } from "./lib/tg.mjs";
 import { discover, poolDetail, priceChange, solUsd } from "./lib/meteora.mjs";
 import { screen, binsFor, sizeFor, exitDecision } from "./lib/rules.mjs";
+import { processPositionClose, settleCloseAccounting } from "./lib/close-safety.mjs";
 
 const DIR = dirname(fileURLToPath(import.meta.url));
 const OPS = join(DIR, "..");
@@ -35,6 +36,32 @@ const tg = new Tg(readEnv(`${OPS}/.env`, "COMMANDS_BOT_TOKEN"), readEnv(`${OPS}/
 const LIVE = () => CONF.mode === "live";
 const tag = () => (LIVE() ? "BIDASK" : "BIDASK-DRY");
 const journal = (ev, o = {}) => appendJsonl(F.journal, { ts: new Date().toISOString(), ev, ...o });
+
+// Keep the integer amount returned by Solana as the source of truth. Rebuilding it
+// from uiAmount with a fixed 1e9 multiplier corrupts dust records for non-9-decimal
+// mints (and can also lose precision through floating-point arithmetic).
+export function parseTokenBalance(result) {
+  if (!Array.isArray(result?.value)) throw new Error("getTokenAccountsByOwner bentuk aneh");
+  let balanceAtomic = 0n;
+  let decimals = null;
+  for (const account of result.value) {
+    const tokenAmount = account?.account?.data?.parsed?.info?.tokenAmount;
+    const accountDecimals = Number(tokenAmount?.decimals);
+    const amount = tokenAmount?.amount;
+    if (!Number.isInteger(accountDecimals) || accountDecimals < 0 || !/^\d+$/.test(String(amount))) {
+      throw new Error("tokenAmount bentuk aneh");
+    }
+    if (decimals != null && decimals !== accountDecimals) throw new Error("decimals token tidak konsisten");
+    decimals = accountDecimals;
+    balanceAtomic += BigInt(amount);
+  }
+  return { amount: Number(balanceAtomic) / 10 ** (decimals ?? 0), balanceAtomic, decimals };
+}
+
+async function readTokenBalance(mint) {
+  const result = await rpc.call("getTokenAccountsByOwner", [WALLET, { mint }, { encoding: "jsonParsed", commitment: "confirmed" }]);
+  return parseTokenBalance(result);
+}
 
 // ── posisi: baca nilai (live via SDK, dry via simulasi harga) ────────────────
 async function readPosition(o) {
@@ -97,17 +124,26 @@ async function closePosition(st, key, o, why) {
   return res;
 }
 
-async function realizedFromWallet(o, balBefore, res, est) {
-  if (o.dry || balBefore == null || o.costSol == null) return { realized: est, basis: o.dry ? "dry" : "est" };
-  await sleep(3000);
-  const balAfter = await rpc.walletSol().catch(() => null);
-  if (balAfter == null) return { realized: est, basis: "est" };
-  const w = round(balAfter - balBefore - o.costSol);
-  const tokenLeft = o.mint ? await rpc.tokenBal(o.mint).catch(() => 1) : 0;
-  const sane = w >= -1.05 * o.deployedSol && w <= 1.0 * o.deployedSol;
-  if (sane && (res.auto_swapped === true || tokenLeft === 0)) return { realized: w, basis: "wallet" };
-  log(`realized wallet ${w} (auto_swapped=${res.auto_swapped}, tokenLeft=${tokenLeft}) ga dipakai — est ${est}`);
-  return { realized: est, basis: "est" };
+async function accountClose(st, o, v, why, now, res, balBefore) {
+  const { realized, basis, countsTowardDaily } = await settleCloseAccounting({
+    day: st.day,
+    position: o,
+    live: v,
+    result: res,
+    walletBefore: balBefore,
+    readWallet: () => rpc.walletSol().catch(() => null),
+    readTokenBalance: (mint) => rpc.tokenBal(mint).catch(() => 1),
+    pause: () => sleep(3000),
+    onFallback: ({ walletDelta, tokenLeft, estimate }) => log(`realized wallet ${walletDelta} (auto_swapped=${res.auto_swapped}, tokenLeft=${tokenLeft}) ga dipakai — est ${estimate}`),
+  });
+  st.cooldowns[o.pool] = now + CONF.exit.cooldownH * 3600e3;
+  if (o.mint) st.cooldowns[o.mint] = now + CONF.exit.cooldownH * 3600e3;
+  const row = { ts: new Date().toISOString(), sym: o.sym, why, pnlPct: o.lastPnlPct, realizedSol: round(realized), basis, heldH: round(hoursSince(o.openedAt), 2),
+    feesSol: round(v.feesSol), deployedSol: o.deployedSol, bins: o.bins, entry: o.entry, pool: o.pool, mode: o.dry ? "dry" : "live" };
+  appendJsonl(F.results, row);
+  await tg.send(`${realized >= 0 ? "✅" : "🔻"} <b>${tag()} CLOSE</b> ${o.sym} (${why}) · ${realized >= 0 ? "+" : ""}${realized.toFixed(3)} SOL${basis !== "wallet" ? ` (${basis})` : ""} · ${o.lastPnlPct}% · fee ${v.feesSol.toFixed(3)} · ${row.heldH}h`);
+  const S = CONF.stages[String(CONF.stage)];
+  if (countsTowardDaily && !o.dry && S && st.day.realizedSol <= -S.dailyHaltSol && !st.halted) { st.halted = true; await tg.send(`🛑 <b>${tag()} HALT</b>: rugi hari ini ${st.day.realizedSol.toFixed(3)} SOL ≥ ${S.dailyHaltSol}. Entry stop sampai besok.`); }
 }
 
 // ── manage posisi terbuka ────────────────────────────────────────────────────
@@ -134,6 +170,30 @@ async function manage(st) {
       continue;
     }
     o.goneMisses = 0;
+
+    const runClose = () => processPositionClose({
+      position: o,
+      live: v,
+      decide: () => exitDecision(o, v, now, CONF.exit),
+      onDecision: (dec) => {
+        Object.assign(o, dec.mutate);
+        if (dec.why) log(`CLOSE ${o.sym} (${dec.why}${dec.detail ? ": " + dec.detail : ""}) pnl ${o.lastPnlPct}%`);
+      },
+      readWallet: () => rpc.walletSol().catch(() => null),
+      persist: () => store.save(st),
+      close: (why) => closePosition(st, key, o, why),
+      isFailed: failed,
+      account: ({ live, reason, result, walletBefore }) => accountClose(st, o, live, reason, now, result, walletBefore),
+    });
+
+    // A previous transaction may already have emptied the LP while confirmation
+    // expired. Resume the persisted close before zero value can become SL-fast or
+    // be mistaken for an empty deploy.
+    if (o.closing) {
+      await runClose();
+      continue;
+    }
+
     // deploy kosong (likuiditas ga landed): struktural, 30 menit pertama
     if (!o.dry && v.amtX === 0 && v.amtY === 0 && hoursSince(o.openedAt) < 0.5) {
       if ((o.emptyTicks = (o.emptyTicks || 0) + 1) >= 2) {
@@ -152,25 +212,8 @@ async function manage(st) {
         if (o.costSol != null) o.costSol = round(o.costSol - (o.deployedSol - v.valueSol)); o.deployedSol = round(v.valueSol);
       }
     }
-    const dec = exitDecision(o, v, now, CONF.exit);
-    Object.assign(o, dec.mutate);
-    if (!dec.why) continue;
-
-    log(`CLOSE ${o.sym} (${dec.why}${dec.detail ? ": " + dec.detail : ""}) pnl ${o.lastPnlPct}%`);
-    const balBefore = o.dry ? null : await rpc.walletSol().catch(() => null);
-    const res = await closePosition(st, key, o, dec.why);
-    if (failed(res)) continue;
-    const est = o.dry ? round(v.valueSol - o.deployedSol - 0.003 * (v.valueSol - v.amtY) - 0.002) : round(v.valueSol * 0.97 - o.deployedSol);
-    const { realized, basis } = await realizedFromWallet(o, balBefore, res, est);
-    st.day.realizedSol += realized;
-    st.cooldowns[o.pool] = now + CONF.exit.cooldownH * 3600e3; // pool yang sama istirahat dulu, apa pun alasan keluarnya
-    if (o.mint) st.cooldowns[o.mint] = now + CONF.exit.cooldownH * 3600e3; // dry 08-29: OTC masuk 2× di 2 pool dalam 1 jam → cooldown per KOIN juga
-    const row = { ts: new Date().toISOString(), sym: o.sym, why: dec.why, pnlPct: o.lastPnlPct, realizedSol: round(realized), basis, heldH: round(hoursSince(o.openedAt), 2),
-      feesSol: round(v.feesSol), deployedSol: o.deployedSol, bins: o.bins, entry: o.entry, pool: o.pool, mode: o.dry ? "dry" : "live" };
-    appendJsonl(F.results, row);
-    await tg.send(`${realized >= 0 ? "✅" : "🔻"} <b>${tag()} CLOSE</b> ${o.sym} (${dec.why}) · ${realized >= 0 ? "+" : ""}${realized.toFixed(3)} SOL${basis !== "wallet" ? ` (${basis})` : ""} · ${o.lastPnlPct}% · fee ${v.feesSol.toFixed(3)} · ${row.heldH}h`);
-    const S = CONF.stages[String(CONF.stage)];
-    if (!o.dry && S && st.day.realizedSol <= -S.dailyHaltSol && !st.halted) { st.halted = true; await tg.send(`🛑 <b>${tag()} HALT</b>: rugi hari ini ${st.day.realizedSol.toFixed(3)} SOL ≥ ${S.dailyHaltSol}. Entry stop sampai besok.`); }
+    const closeOutcome = await runClose();
+    if (closeOutcome.handled) continue;
   }
 }
 
@@ -186,7 +229,8 @@ async function sellPending(st) {
   for (const [mint, ps] of Object.entries(st.pendingSells)) {
     if (ps.nextTry && Date.now() < ps.nextTry) continue;
 
-    let bal; try { bal = await rpc.tokenBal(mint); } catch (e) { log(`pendingSell ${ps.sym}: ${e.message}`); continue; }
+    let balance; try { balance = await readTokenBalance(mint); } catch (e) { log(`pendingSell ${ps.sym}: ${e.message}`); continue; }
+    const bal = balance.amount;
 
     // KOSONG — bukan terjual, tapi tidak ada lagi yang bisa dijual. Reclaim rent-nya.
     if (bal <= 0) {
@@ -206,7 +250,7 @@ async function sellPending(st) {
 
     // Batas percobaan: sisa yang ga bisa dijual ga boleh jadi loop fee abadi.
     if ((ps.tries || 0) >= MAX_PENDING_TRIES) {
-      recordDust({ mint, symbol: ps.sym, balanceAtomic: Math.round(bal * 1e9),
+      recordDust({ mint, symbol: ps.sym, balanceAtomic: balance.balanceAtomic, decimals: balance.decimals,
         reason: `tidak bisa dijual setelah ${ps.tries}× percobaan`, position: null });
       await tg.send(`🧹 ${tag()}: sisa ${ps.sym} ditandai DUST setelah ${ps.tries}× (BUKAN terjual)`);
       delete st.pendingSells[mint];
@@ -224,7 +268,8 @@ async function sellPending(st) {
     }
 
     // Terjual (kata CLI). Hanya baca ulang on-chain yang boleh memutuskan.
-    let after; try { after = await rpc.tokenBal(mint); } catch (e) { log(`pendingSell ${ps.sym}: baca ulang gagal: ${e.message}`); continue; }
+    let afterBalance; try { afterBalance = await readTokenBalance(mint); } catch (e) { log(`pendingSell ${ps.sym}: baca ulang gagal: ${e.message}`); continue; }
+    const after = afterBalance.amount;
     if (after <= 0) {
       log(`pendingSell ${ps.sym}: SOLD bersih ${bal}`);
       await tg.send(`🧹 ${tag()}: sisa token ${ps.sym} kejual (${ps.why})`);
@@ -236,7 +281,7 @@ async function sellPending(st) {
 
     // Sisa sedikit setelah penjualan = DUST, bukan "belum selesai".
     if (bal > 0 && after / bal < RESIDUAL_DUST_RATIO) {
-      recordDust({ mint, symbol: ps.sym, balanceAtomic: Math.round(after * 1e9),
+      recordDust({ mint, symbol: ps.sym, balanceAtomic: afterBalance.balanceAtomic, decimals: afterBalance.decimals,
         reason: `sisa ${after} setelah menjual ${bal} — dust, bukan terjual penuh`, position: null });
       log(`pendingSell ${ps.sym}: sisa ${after} ditandai DUST — berhenti retry`);
       delete st.pendingSells[mint];
